@@ -11,9 +11,6 @@ venv/
 !config.json
 !package.json
 !tsconfig.json
-!genmaster-hub-main/package.json
-!genmaster-hub-main/tsconfig.json
-!genmaster-hub-main/components.json
 !debug/inspection/report.json
 # Ignore service account keys
 tehnosave-*.json
@@ -30,3 +27,4 @@ chrome_3/
 *.log
 state/
 uploads/
+genmaster-hub-main/
