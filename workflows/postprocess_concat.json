@@ -1,0 +1,9 @@
+{
+  "name": "Пост-обработка: скачивание и склейка",
+  "steps": [
+    {"id": "open", "type": "open_projects", "params": {}},
+    {"id": "wait", "type": "wait_ready", "params": {"episode_id": "{{episode_id}}", "parts": "{{parts}}"}},
+    {"id": "download", "type": "download_video", "params": {"episode_id": "{{episode_id}}", "parts": "{{parts}}", "target_dir": "{{download_dir}}"}},
+    {"id": "concat", "type": "ffmpeg_concat", "params": {"inputs": "{{downloaded_paths}}", "intro": "{{intro_path}}", "output_opts": {"preset": "medium", "crf": 23}, "output_path": "{{output_path}}"}}
+  ]
+}

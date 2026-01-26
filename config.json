@@ -1,0 +1,152 @@
+{
+  "csv_file": "/Users/ilya/Projects/heygen_automation/state/run_projects_1769023438.csv",
+  "max_scenes": 70,
+  "browser": "chrome",
+  "enable_enhance_voice": false,
+  "playwright_timeout_ms": 3000,
+  "pre_fill_wait": 1.5,
+  "delay_between_scenes": 1.5,
+  "confirm_timeout_sec": 10,
+  "pre_generation_pause_sec": 20,
+  "post_reload_wait": 20,
+  "reload_timeout_ms": 90000,
+  "search_results_timeout_ms": 5000,
+  "validation_ready_timeout_ms": 6000,
+  "save_notification_timeout_ms": 4000,
+  "save_fallback_wait_sec": 7,
+  "generation_redirect_timeout_ms": 180000,
+  "orientation_choice": "Горизонтальная",
+  "media_source": "getty",
+  "enable_notifications": true,
+  "csv_columns": {
+    "episode_id": "episode_id",
+    "part_idx": "part_idx",
+    "scene_idx": "scene_idx",
+    "speaker": "speaker",
+    "text": "text",
+    "brolls": "broll_query",
+    "title": "title",
+    "template_url": "template_url"
+  },
+  "__comments": {
+    "csv_file": "Имя CSV файла со сценариями",
+    "max_scenes": "Максимум сцен в шаблоне HeyGen",
+    "browser": "Режим браузера: chrome|multilogin",
+    "enable_enhance_voice": "Автоклик по кнопке Enhance Voice после вставки",
+    "playwright_timeout_ms": "Default timeout для Playwright операций",
+    "pre_fill_wait": "Пауза после загрузки страницы до начала заполнения",
+    "delay_between_scenes": "Пауза между заполнениями сцен",
+    "confirm_timeout_sec": "Таймаут подтверждения (если не задан pre_generation_pause_sec)",
+    "pre_generation_pause_sec": "Пауза перед отправкой на генерацию (заменяет confirm_timeout_sec)",
+    "post_reload_wait": "Фолбэк-пауза после reload, если селекторы не готовы",
+    "reload_timeout_ms": "Таймаут page.reload при проверке",
+    "search_results_timeout_ms": "Ожидание результатов поиска в панели Медиа",
+    "validation_ready_timeout_ms": "Ожидание готовности DOM для валидации",
+    "save_notification_timeout_ms": "Ожидание уведомления 'Сохранено'",
+    "save_fallback_wait_sec": "Пауза, если уведомление 'Сохранено' не появилось",
+    "generation_redirect_timeout_ms": "Таймаут редиректа на /projects после 'Отправить'",
+    "orientation_choice": "Выбор ориентации: Горизонтальная|Вертикальная",
+    "media_source": "Источник для поиска B-roll: all|getty|storyblocks|pexels",
+    "enable_notifications": "Включить macOS уведомления",
+    "csv_columns": "Переименование колонок CSV для совместимости",
+    "episodes_to_process": "Список эпизодов для обработки (если пустой — из CSV)",
+    "close_media_panel_after_broll": "Закрывать панель Медиа после вставки B-roll",
+    "interactive_on_mismatch": "Требовать вмешательство при несоответствии",
+    "abort_on_validation_failure": "Прерывать процесс при несоответствии",
+    "profiles": "Профили CDP для Chrome (имя→URL, профиль)",
+    "profile_to_use": "Какой профиль использовать (имя или 'ask')"
+  },
+  "episodes_to_process": [
+    "ep_prostate_5ways",
+    "dementia_vegetables"
+  ],
+  "close_media_panel_after_broll": true,
+  "interactive_on_mismatch": true,
+  "abort_on_validation_failure": false,
+  "profiles": {
+    "chrome_automation": {
+      "cdp_url": "http://localhost:9222",
+      "profile_path": "~/chrome_automation"
+    },
+    "chrome_heygen_2": {
+      "cdp_url": "http://localhost:9223",
+      "profile_path": "~/chrome_heygen_2"
+    }
+  },
+  "profile_to_use": "ask",
+  "headless": false,
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "download_dir": "./downloads",
+  "max_concurrency": 1,
+  "parallel_mode": "tabs",
+  "chrome_cdp_url": "http://localhost:9222",
+  "multilogin_cdp_url": "",
+  "workflow_file": "generate_episode.json",
+  "workflow_steps": [
+    {
+      "id": "navigate_to_template",
+      "type": "navigate_to_template",
+      "params": {
+        "timeout_ms": 120000,
+        "wait_until": "domcontentloaded"
+      }
+    },
+    {
+      "id": "wait_editor",
+      "type": "wait_for",
+      "params": {
+        "selector": "span[data-node-view-content-react]",
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "id": "pre_fill_sleep",
+      "type": "wait",
+      "params": {
+        "sec": 1.0
+      }
+    },
+    {
+      "id": "fill_scene",
+      "type": "fill_scene",
+      "params": {
+        "handle_broll": true
+      }
+    },
+    {
+      "id": "refresh_validate_1",
+      "type": "reload_and_validate",
+      "params": {
+        "interactive": false
+      }
+    },
+    {
+      "id": "delete_empty_scenes",
+      "type": "delete_empty_scenes",
+      "params": {}
+    },
+    {
+      "id": "refresh_validate_2",
+      "type": "reload_and_validate",
+      "params": {
+        "interactive": true
+      }
+    },
+    {
+      "id": "confirm",
+      "type": "confirm",
+      "params": {}
+    },
+    {
+      "id": "generate",
+      "type": "generate",
+      "params": {}
+    },
+    {
+      "id": "final_submit",
+      "type": "final_submit",
+      "params": {}
+    }
+  ]
+}

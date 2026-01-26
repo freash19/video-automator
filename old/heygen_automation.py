@@ -1,0 +1,700 @@
+import asyncio
+import pandas as pd
+import random
+from playwright.async_api import async_playwright, Page
+import os
+import json
+import re
+import sys
+import argparse
+import subprocess
+from urllib.parse import urlparse
+
+class HeyGenAutomation:
+    def __init__(self, csv_path: str, config: dict):
+        """
+        Инициализация автоматизации HeyGen
+        
+        Args:
+            csv_path: Путь к CSV файлу со сценариями
+            config: Конфигурация
+        """
+        self.csv_path = csv_path
+        self.config = config or {}
+        self.df = None
+        self.selected_profile = None
+        
+    def load_data(self):
+        """Загрузить данные из CSV"""
+        print(f"📁 Загружаю данные из {self.csv_path}...")
+        
+        try:
+            # Сначала пробуем с точкой с запятой
+            self.df = pd.read_csv(self.csv_path, encoding='utf-8', sep=';')
+            print(f"✅ Загружено {len(self.df)} строк (разделитель: ;)")
+        except Exception as e1:
+            print(f"⚠️ Не удалось прочитать с разделителем ';': {e1}")
+            print(f"   Пробую автоопределение разделителя...")
+            try:
+                # Пробуем автоопределение
+                self.df = pd.read_csv(self.csv_path, encoding='utf-8', sep=None, engine='python')
+                print(f"✅ Загружено {len(self.df)} строк (автоопределение)")
+            except Exception as e2:
+                print(f"❌ Ошибка чтения CSV с автоопределением: {e2}")
+                print(f"\n💡 Проверьте файл CSV:")
+                print(f"   1. Откройте в текстовом редакторе")
+                print(f"   2. Убедитесь, что разделитель - точка с запятой (;)")
+                print(f"   3. Проверьте строку 6 на наличие лишних символов")
+                print(f"   4. Команда для проверки: head -10 {self.csv_path}")
+                return None
+        
+        print(f"✅ Загружено {len(self.df)} строк")
+        print(f"📋 Колонки в CSV: {list(self.df.columns)}")
+        print("")
+        
+        # Проверяем наличие обязательных колонок
+        required_columns = ['episode_id', 'part_idx', 'scene_idx', 'speaker', 'text', 'title']
+        missing_columns = [col for col in required_columns if col not in self.df.columns]
+        
+        if missing_columns:
+            print(f"❌ ОШИБКА: В CSV отсутствуют обязательные колонки:")
+            for col in missing_columns:
+                print(f"   - {col}")
+            print(f"\n📋 Найденные колонки: {list(self.df.columns)}")
+            print(f"\n💡 Исправь первую строку CSV на:")
+            print(f"   episode_id,part_idx,scene_idx,speaker,text,title,template_url")
+            return None
+        
+        # Показываем первые строки для проверки
+        print("📊 Первые строки данных:")
+        print(self.df.head(3).to_string(index=False))
+        print("")
+        
+        return self.df
+    
+    def get_all_episode_parts(self, episode_id: str):
+        """
+        Получить все части конкретного эпизода
+        
+        Args:
+            episode_id: ID эпизода (например, 'ep_1')
+            
+        Returns:
+            list: Список номеров частей
+        """
+        episode_data = self.df[self.df['episode_id'] == episode_id]
+        
+        if episode_data.empty:
+            return []
+        
+        parts = sorted(episode_data['part_idx'].unique())
+        return parts
+    
+    def get_episode_data(self, episode_id: str, part_idx: int):
+        """
+        Получить данные для конкретного эпизода и части
+        
+        Args:
+            episode_id: ID эпизода (например, 'ep_1')
+            part_idx: Номер части (например, 1)
+            
+        Returns:
+            tuple: (template_url, list of scenes)
+        """
+        # Фильтруем данные по episode_id и part_idx
+        episode_data = self.df[
+            (self.df['episode_id'] == episode_id) & 
+            (self.df['part_idx'] == part_idx)
+        ].copy()
+        
+        if episode_data.empty:
+            print(f"⚠️ Нет данных для {episode_id}, часть {part_idx}")
+            return None, []
+        
+        # Получаем URL шаблона из ЛЮБОЙ строки этого эпизода (они одинаковые для всех частей)
+        episode_rows = self.df[self.df['episode_id'] == episode_id]
+        template_url = episode_rows.iloc[0]['template_url'] if 'template_url' in episode_rows.columns else None
+        
+        # Сортируем по scene_idx
+        episode_data = episode_data.sort_values('scene_idx')
+        
+        # Формируем список сцен
+        scenes = []
+        for _, row in episode_data.iterrows():
+            scenes.append({
+                'scene_idx': int(row['scene_idx']),
+                'speaker': row['speaker'],
+                'text': row['text'],
+                'title': row.get('title', f"{episode_id}_part_{part_idx}")
+            })
+        
+        print(f"📋 Эпизод: {episode_id}, Часть: {part_idx}")
+        print(f"🔗 URL шаблона: {template_url}")
+        print(f"🎬 Сцен для заполнения: {len(scenes)}")
+        
+        return template_url, scenes
+    
+    async def fill_scene(self, page: Page, scene_number: int, text: str):
+        """
+        Заполнить конкретную сцену текстом
+        
+        Args:
+            page: Playwright страница
+            scene_number: Номер сцены (1, 2, 3, ...)
+            text: Текст для вставки
+        """
+        text_label = f"text_{scene_number}"
+        print(f"  ✏️  Заполняю сцену {scene_number}: {text_label}")
+        
+        try:
+            # Ищем span с текстом text_X
+            span_locator = page.locator('span[data-node-view-content-react]').filter(has_text=re.compile(rf'^\s*{re.escape(text_label)}\s*$'))
+            
+            # Проверяем существование
+            count = await span_locator.count()
+            if count == 0:
+                print(f"  ⚠️  Не найдено поле {text_label}")
+                return False
+            
+            # Кликаем на span
+            await span_locator.first.click()
+            await asyncio.sleep(random.uniform(0.2, 0.4))
+            
+            # Очищаем содержимое
+            await page.keyboard.press('Meta+A')
+            await asyncio.sleep(0.1)
+            await page.keyboard.press('Backspace')
+            await asyncio.sleep(random.uniform(0.1, 0.2))
+            
+            # Вставляем текст через буфер обмена (быстрее)
+            await page.keyboard.insert_text(text)
+            await asyncio.sleep(random.uniform(0.2, 0.4))
+            await page.keyboard.press('Tab')
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            try:
+                current_text = await span_locator.first.inner_text()
+                if current_text.strip() != text.strip():
+                    for _ in range(2):
+                        await span_locator.first.click()
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press('Meta+A')
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.press('Backspace')
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.insert_text(text)
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press('Tab')
+                        await asyncio.sleep(0.4)
+                        current_text = await span_locator.first.inner_text()
+                        if current_text.strip() == text.strip():
+                            break
+            except Exception:
+                pass
+            print(f"  ✅ Сцена {scene_number} заполнена")
+            
+            # Находим и нажимаем кнопку "Enhance Voice"
+            try:
+                enhance_buttons = page.locator('button:has(iconpark-icon[name="director-mode"])').filter(has_text=re.compile(r'Enhance Voice|Усилить голос'))
+                button_count = await enhance_buttons.count()
+                if button_count > 0:
+                    await enhance_buttons.last.click()
+                    print(f"  🎙️  Нажата кнопка 'Enhance Voice'")
+                    await asyncio.sleep(1.0)
+                else:
+                    print(f"  ⚠️  Видимая кнопка 'Enhance Voice' не найдена (пропускаю)")
+            except Exception as e:
+                print(f"  ⚠️  Не удалось нажать 'Enhance Voice': {e} (продолжаю)")
+            
+            await asyncio.sleep(random.uniform(0.3, 0.6))
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ Ошибка при заполнении сцены {scene_number}: {e}")
+            return False
+
+    async def refresh_and_validate(self, page: Page, scenes):
+        """
+        Обновление страницы, до-замена text_X, проверка ожидаемых текстов и диагностика
+        """
+        print("\n🔄 Обновляю страницу и проверяю тексты...")
+        try:
+            await page.reload(wait_until='domcontentloaded')
+            await asyncio.sleep(2)
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить страницу: {e}")
+        try:
+            placeholders = page.locator('span[data-node-view-content-react]').filter(has_text=re.compile(r'^\s*text_\d+\s*$'))
+            count = await placeholders.count()
+            if count > 0:
+                print(f"🔧 Осталось плейсхолдеров: {count}")
+                scene_text_map = {s['scene_idx']: s['text'] for s in scenes}
+                for i in range(count):
+                    loc = placeholders.nth(i)
+                    t = await loc.inner_text()
+                    m = re.search(r'(\d+)', t)
+                    if not m:
+                        continue
+                    idx = int(m.group(1))
+                    if idx in scene_text_map:
+                        await loc.click()
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press('Meta+A')
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.press('Backspace')
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.insert_text(scene_text_map[idx])
+                        await asyncio.sleep(0.2)
+                        await page.keyboard.press('Tab')
+                        await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ Ошибка при до-замене плейсхолдеров: {e}")
+        expected_texts = [s['text'] for s in scenes]
+        print("🔍 Проверяю наличие ожидаемых текстов...")
+        for t in expected_texts:
+            try:
+                found = await page.get_by_text(re.compile(re.escape(t))).count()
+                if found == 0:
+                    print(f"❌ Текст отсутствует: {t[:80]}")
+                    raise Exception("Отсутствует ожидаемый текст")
+            except Exception as e:
+                print(f"❌ Проверка текста провалена: {e}")
+                raise
+        try:
+            all_spans = page.locator('span[data-node-view-content-react]')
+            texts = await all_spans.all_text_contents()
+            expected_set = set(expected_texts)
+            phantom = []
+            for s in texts:
+                st = s.strip()
+                if re.fullmatch(r'text_\d+', st):
+                    continue
+                if st and st not in expected_set:
+                    phantom.append(st)
+            if phantom:
+                print("🧭 Фантомные тексты:")
+                for p in phantom[:20]:
+                    print(f"   • {p[:120]}")
+            else:
+                print("✅ Фантомных текстов не обнаружено")
+        except Exception as e:
+            print(f"⚠️ Диагностика фантомных текстов не выполнена: {e}")
+    
+    async def delete_empty_scenes(self, page: Page, filled_scenes_count: int, max_scenes: int = 15):
+        """
+        Удалить все пустые сцены после заполненных
+        
+        Args:
+            page: Playwright страница
+            filled_scenes_count: Количество заполненных сцен
+            max_scenes: Максимальное количество сцен в шаблоне
+        """
+        empty_scenes = list(range(filled_scenes_count + 1, max_scenes + 1))
+        
+        if not empty_scenes:
+            print("✅ Все сцены заполнены, удаление не требуется")
+            return
+        
+        print(f"\n🗑️  Удаляю пустые сцены: {empty_scenes}")
+        
+        for scene_num in empty_scenes:
+            try:
+                text_label = f"text_{scene_num}"
+                print(f"  🗑️  Удаляю сцену {scene_num}: {text_label}")
+                
+                # Находим span с текстом text_X
+                span_locator = page.locator(f'span[data-node-view-content-react]:has-text("{text_label}")')
+                
+                # Проверяем существование
+                count = await span_locator.count()
+                if count == 0:
+                    print(f"  ⚠️  Сцена {text_label} не найдена, пропускаю")
+                    continue
+                
+                # Кликаем на span, чтобы выделить сцену
+                await span_locator.first.click()
+                await asyncio.sleep(random.uniform(0.3, 0.5))
+                
+                # Ищем кнопку с тремя точками (more-level)
+                more_button = page.locator('button:has(iconpark-icon[name="more-level"])')
+                
+                # Проверяем существование кнопки
+                button_count = await more_button.count()
+                if button_count == 0:
+                    print(f"  ⚠️  Кнопка меню не найдена для {text_label}")
+                    continue
+                
+                # Кликаем на кнопку с тремя точками (берем последнюю видимую)
+                await more_button.last.click()
+                await asyncio.sleep(random.uniform(0.3, 0.5))
+                
+                # Ждем появления меню и ищем пункт "Удалить сцену"
+                delete_item = page.locator('div[role="menuitem"]').filter(has_text=re.compile(r'Удалить сцену|Delete scene'))
+                
+                # Проверяем существование пункта меню
+                delete_count = await delete_item.count()
+                if delete_count == 0:
+                    print(f"  ⚠️  Пункт 'Удалить сцену' не найден")
+                    continue
+                
+                # Кликаем на "Удалить сцену"
+                await delete_item.first.click()
+                await asyncio.sleep(random.uniform(0.5, 0.8))
+                
+                print(f"  ✅ Сцена {scene_num} удалена")
+                
+            except Exception as e:
+                print(f"  ❌ Ошибка при удалении сцены {scene_num}: {e}")
+                continue
+        
+        print("✅ Удаление пустых сцен завершено")
+    
+    async def click_generate_button(self, page: Page):
+        """
+        Нажать кнопку "Сгенерировать"
+        
+        Args:
+            page: Playwright страница
+        """
+        print("\n🔘 Нажимаю кнопку 'Сгенерировать'...")
+        
+        try:
+            # Ищем кнопку по тексту
+            button = page.locator('button').filter(has_text=re.compile(r'Сгенерировать|Generate'))
+            
+            # Проверяем существование
+            count = await button.count()
+            if count == 0:
+                print("❌ Кнопка 'Сгенерировать' не найдена")
+                return False
+            
+            # Скроллим к кнопке
+            await button.scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.3, 0.5))
+            
+            # Кликаем
+            await button.click()
+            print("✅ Кнопка 'Сгенерировать' нажата")
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Ошибка при нажатии кнопки: {e}")
+            return False
+    
+    async def fill_and_submit_final_window(self, page: Page, title: str):
+        """
+        Заполнить название видео и нажать "Отправить" в финальном окне
+        
+        Args:
+            page: Playwright страница
+            title: Название видео
+        """
+        print(f"\n📝 Заполняю финальное окно с названием: {title}")
+        
+        try:
+            # Ждем появления попап окна с заголовком "Сгенерировать видео"
+            print("  ⏳ Жду появления окна генерации...")
+            await page.wait_for_selector('div:has-text("Сгенерировать видео")', timeout=10000)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            
+            # Находим поле ввода по placeholder
+            input_field = page.locator('input[placeholder="Без названия — видео"]')
+            
+            # Проверяем существование
+            count = await input_field.count()
+            if count == 0:
+                print("  ❌ Поле ввода названия не найдено")
+                return False
+            
+            # В попапе может быть несколько таких полей, берем последний (в попапе)
+            print(f"  ✏️  Ввожу название: {title}")
+            
+            # Кликаем на поле
+            await input_field.last.click()
+            await asyncio.sleep(random.uniform(0.2, 0.3))
+            
+            # Очищаем поле
+            await page.keyboard.press('Meta+A')
+            await asyncio.sleep(0.1)
+            await page.keyboard.press('Backspace')
+            await asyncio.sleep(random.uniform(0.1, 0.2))
+            
+            # Вводим название
+            await page.keyboard.insert_text(title)
+            await asyncio.sleep(random.uniform(0.3, 0.5))
+            
+            print("  ✅ Название введено")
+            
+            # Находим кнопку "Отправить" в попапе
+            submit_button = page.locator('button:has-text("Отправить")')
+            
+            # Проверяем существование
+            button_count = await submit_button.count()
+            if button_count == 0:
+                print("  ❌ Кнопка 'Отправить' не найдена")
+                return False
+            
+            print("  🚀 Нажимаю кнопку 'Отправить'...")
+            
+            # Кликаем на кнопку
+            await submit_button.last.click()
+            
+            print("  ✅ Видео отправлено на генерацию!")
+            print("  ⏳ Жду редиректа на страницу проектов...")
+            
+            # Ждем редиректа на страницу projects (до 60 секунд)
+            try:
+                await page.wait_for_url("**/projects**", timeout=60000)
+                print("  ✅ Редирект выполнен, видео в процессе генерации!")
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"  ⚠️ Таймаут ожидания редиректа, но продолжаю: {e}")
+                await asyncio.sleep(3)
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ Ошибка при заполнении финального окна: {e}")
+            return False
+    
+    async def process_episode_part(self, episode_id: str, part_idx: int):
+        """
+        Обработать одну часть эпизода
+        
+        Args:
+            episode_id: ID эпизода
+            part_idx: Номер части
+        """
+        # Получаем данные
+        template_url, scenes = self.get_episode_data(episode_id, part_idx)
+        
+        if not template_url or not scenes:
+            print(f"❌ Нет данных для обработки")
+            return False
+        
+        async with async_playwright() as p:
+            print("\n🌐 Подключаюсь к Chrome через CDP...")
+            profile_cfg = None
+            try:
+                profiles = self.config.get('profiles') or {}
+                name = self.selected_profile or self.config.get('profile_to_use')
+                profile_cfg = profiles.get(name) if name and name in profiles else None
+                cdp_url = (profile_cfg or {}).get('cdp_url') or self.config.get('chrome_cdp_url') or 'http://localhost:9222'
+                profile_path = (profile_cfg or {}).get('profile_path')
+            except Exception:
+                cdp_url = self.config.get('chrome_cdp_url') or 'http://localhost:9222'
+                profile_path = None
+            async def try_connect():
+                return await p.chromium.connect_over_cdp(cdp_url)
+            try:
+                try:
+                    browser = await try_connect()
+                except Exception:
+                    parsed = urlparse(cdp_url)
+                    port = parsed.port or 9222
+                    chrome_bin = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+                    args = [
+                        chrome_bin,
+                        f'--remote-debugging-port={port}',
+                        *( [f'--user-data-dir={os.path.expanduser(profile_path)}'] if profile_path else [] )
+                    ]
+                    print(f"🚀 Стартую Chrome на порту {port}...")
+                    try:
+                        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        await asyncio.sleep(2.5)
+                        browser = await try_connect()
+                    except Exception as e2:
+                        print(f"❌ Автозапуск Chrome не удался: {e2}")
+                        return False
+                print("✅ Подключился к Chrome")
+                contexts = browser.contexts
+                if not contexts:
+                    print("❌ Нет открытых окон в Chrome")
+                    return False
+                context = contexts[0]
+                page = await context.new_page()
+            except Exception as e:
+                print(f"❌ Ошибка подключения к Chrome: {e}")
+                return False
+            
+            # Переходим на страницу шаблона
+            print(f"📄 Открываю шаблон: {template_url}")
+            await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
+            
+            # Ждем загрузки страницы и появления первого поля text_1
+            print("⏳ Жду загрузки страницы и элементов...")
+            try:
+                # Ждем появления первого текстового поля (до 30 секунд)
+                await page.wait_for_selector('span[data-node-view-content-react]', timeout=30000)
+                print("✅ Элементы загрузились!")
+            except Exception as e:
+                print(f"⚠️ Timeout при ожидании элементов, но продолжаю: {e}")
+            
+            # Дополнительная пауза для стабильности
+            await asyncio.sleep(3)
+            
+            # Заполняем сценЫ
+            print(f"\n📝 Начинаю заполнение {len(scenes)} сцен...")
+            success_count = 0
+            
+            for scene in scenes:
+                success = await self.fill_scene(
+                    page, 
+                    scene['scene_idx'], 
+                    scene['text']
+                )
+                if success:
+                    success_count += 1
+            
+            print(f"\n📊 Заполнено сцен: {success_count}/{len(scenes)}")
+            
+            await self.refresh_and_validate(page, scenes)
+            await self.delete_empty_scenes(page, len(scenes), self.config.get('max_scenes', 15))
+            
+            # Нажимаем кнопку "Сгенерировать"
+            await self.click_generate_button(page)
+            
+            # Заполняем финальное окно и отправляем
+            title = scenes[0]['title']
+            await self.fill_and_submit_final_window(page, title)
+            
+            # Вкладка автоматически закроется после обработки
+            print(f"\n✅ Часть {part_idx} обработана и отправлена на генерацию!")
+            
+            # Закрываем вкладку
+            await page.close()
+            print(f"🔒 Вкладка закрыта\n")
+            
+            return True
+            
+    async def process_full_episode(self, episode_id: str):
+        """
+        Обработать все части эпизода автоматически
+        
+        Args:
+            episode_id: ID эпизода (например, 'ep_1')
+        """
+        # Получаем все части эпизода
+        parts = self.get_all_episode_parts(episode_id)
+        
+        if not parts:
+            print(f"❌ Нет частей для эпизода {episode_id}")
+            return False
+        
+        print(f"\n{'='*60}")
+        print(f"📺 Обработка эпизода: {episode_id}")
+        print(f"📋 Найдено частей: {len(parts)} - {parts}")
+        print(f"{'='*60}\n")
+        
+        # Обрабатываем каждую часть
+        for i, part_idx in enumerate(parts, 1):
+            print(f"\n{'='*60}")
+            print(f"🎬 Обрабатываю {episode_id}, часть {part_idx} ({i}/{len(parts)})")
+            print(f"{'='*60}\n")
+            
+            success = await self.process_episode_part(episode_id, part_idx)
+            
+            if not success:
+                print(f"❌ Ошибка при обработке части {part_idx}, останавливаюсь")
+                return False
+            
+            print(f"✅ Часть {part_idx} успешно обработана и отправлена на генерацию!")
+            
+            # Пауза между частями (кроме последней)
+            if i < len(parts):
+                wait_time = 5
+                print(f"\n⏳ Пауза {wait_time} секунд перед следующей частью...")
+                await asyncio.sleep(wait_time)
+        
+        print(f"\n{'='*60}")
+        print(f"🎉 ВСЕ ЧАСТИ ЭПИЗОДА {episode_id} ОБРАБОТАНЫ!")
+        print(f"{'='*60}\n")
+        
+        return True
+
+
+async def main():
+    """
+    Основная функция для тестирования
+    """
+    print("=" * 60)
+    print("🎬 HeyGen Automation Script")
+    print("=" * 60)
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--profile', type=str, help='Имя профиля Chrome из config.json')
+    args = parser.parse_args()
+    
+    # Загружаем конфигурацию
+    config_path = "config.json"
+    
+    if not os.path.exists(config_path):
+        print(f"❌ Файл конфигурации {config_path} не найден!")
+        print("   Создай файл config.json по инструкции")
+        return
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except Exception as e:
+        print(f"❌ Ошибка чтения конфигурации: {e}")
+        return
+    
+    csv_path = config.get('csv_file', 'scenarios.csv')
+    episode_id = config.get('episode_to_process', 'ep_1')
+    
+    print(f"\n📋 Конфигурация:")
+    print(f"   CSV файл: {csv_path}")
+    print(f"   Эпизод для обработки: {episode_id}")
+    print(f"   Макс. сцен в шаблоне: {config.get('max_scenes', 15)}")
+    print(f"   Профили: {list((config.get('profiles') or {}).keys())}")
+    
+    # Проверяем существование CSV файла
+    if not os.path.exists(csv_path):
+        print(f"\n❌ CSV файл {csv_path} не найден!")
+        print(f"   Положи файл в папку: {os.getcwd()}")
+        return
+    
+    selected_profile = None
+    profiles = config.get('profiles') or {}
+    cli_profile = args.profile
+    if cli_profile:
+        if cli_profile in profiles:
+            selected_profile = cli_profile
+        else:
+            print(f"⚠️ Профиль {cli_profile} не найден, использую конфиг")
+    if not selected_profile:
+        pref = config.get('profile_to_use')
+        if pref and pref != 'ask' and pref in profiles:
+            selected_profile = pref
+        else:
+            names = list(profiles.keys())
+            print("\n🧭 Доступные профили:")
+            for i, n in enumerate(names, 1):
+                print(f"  {i}. {n} → {profiles[n]['cdp_url']}")
+            try:
+                ans = input("Выберите профиль по номеру или имени: ").strip()
+                if ans.isdigit() and 1 <= int(ans) <= len(names):
+                    selected_profile = names[int(ans)-1]
+                elif ans in profiles:
+                    selected_profile = ans
+                else:
+                    selected_profile = names[0] if names else None
+            except Exception:
+                selected_profile = names[0] if names else None
+    automation = HeyGenAutomation(csv_path, config)
+    automation.selected_profile = selected_profile
+    
+    automation.load_data()
+    
+    # Обрабатываем весь эпизод со всеми частями
+    print("\n" + "=" * 60)
+    print(f"🚀 Запускаю обработку эпизода: {episode_id}")
+    print("=" * 60 + "\n")
+    
+    await automation.process_full_episode(episode_id)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

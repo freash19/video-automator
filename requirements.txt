@@ -1,0 +1,10 @@
+pandas
+playwright
+streamlit
+python-telegram-bot
+apscheduler
+pydantic
+requests
+fastapi
+uvicorn[standard]
+python-multipart

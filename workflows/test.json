@@ -1,0 +1,37 @@
+{
+  "name": "select_parts_and_move",
+  "steps": [
+    {
+      "id": "1",
+      "type": "navigate",
+      "params": {
+        "url": "https://app.heygen.com/projects",
+        "wait_until": "domcontentloaded",
+        "timeout_ms": 120000
+      }
+    },
+    {
+      "id": "2",
+      "type": "wait_for",
+      "params": {
+        "selector": ".tw-w-full:nth-child(3) > div:nth-child(2) > div span.tw-flex-1",
+        "state": "visible",
+        "timeout_ms": 60000
+      }
+    },
+    {
+      "id": "3",
+      "type": "select_episode_parts",
+      "params": {
+        "episode": "{{episode_id}}",
+        "title_selector": ".tw-w-full:nth-child(3) > div:nth-child(2) > div span.tw-flex-1",
+        "checkbox_selector": ".tw-relative:nth-child(14) .tw-pointer-events-auto:nth-child(4) .tw-absolute:nth-child(1)",
+        "button_selector": "button.prism\\:disabled\\:tw-opacity-disabled:nth-child(2)",
+        "timeout_ms": 60000,
+        "hover_sec": 0.15,
+        "card_xpath": "xpath=ancestor::div[contains(@class,\"tw-relative\")][1]"
+      }
+    }
+  ],
+  "settings": {}
+}

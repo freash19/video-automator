@@ -1,0 +1,15 @@
+episode_id,part_idx,scene_idx,speaker,text,brolls,title,template_url
+ep_cellular_aging,1,1,Peter,"Знаете, за тридцать пять лет практики я видел немало пациентов.",,ep_cellular_aging_p1,https://app.heygen.com/create-v4/draft?vt=l&template_id=4c1cab44c26046c591e69067c2321c6c&private=1&fromCreateButton=true
+ep_cellular_aging,1,2,Peter,"Которые спрашивали меня: Доктор, почему один человек в шестьдесят выглядит на сорок?",,ep_cellular_aging_p1,
+ep_cellular_aging,1,3,Peter,А другой в сорок — на шестьдесят?,young old man energy comparison side by side,ep_cellular_aging_p1,
+ep_cellular_aging,1,4,Peter,"И честно говоря, до недавнего времени я не мог дать точный ответ.",,ep_cellular_aging_p1,
+ep_cellular_aging,1,5,Peter,"Говорил о генетике, образе жизни, питании.",doctor consulting elderly patient office friendly,ep_cellular_aging_p1,
+ep_cellular_aging,1,6,Peter,Но в ноябре две тысячи двадцать пятого года вышло исследование.,,ep_cellular_aging_p1,
+ep_cellular_aging,1,7,Peter,Которое наконец объяснило главный механизм старения.,scientific breakthrough laboratory microscope research,ep_cellular_aging_p1,
+ep_cellular_aging,1,8,Peter,И сегодня я расскажу вам об этом простым языком.,,ep_cellular_aging_p1,
+ep_cellular_aging,1,9,Peter,"Без сложных терминов. Так, чтобы было понятно каждому.",,ep_cellular_aging_p1,
+ep_cellular_aging,1,10,Peter,Давайте начнем с необычного заболевания.,,ep_cellular_aging_p1,
+ep_cellular_aging_2,2,1,Peter,Которое наконец объяснило главный механизм старения.,scientific breakthrough laboratory microscope research,ep_cellular_aging_p2,https://app.heygen.com/create-v4/draft?vt=l&template_id=4c1cab44c26046c591e69067c2321c6c&private=1&fromCreateButton=true
+ep_cellular_aging_2,2,2,Peter,И сегодня я расскажу вам об этом простым языком.,,ep_cellular_aging_p2,
+ep_cellular_aging_2,2,3,Peter,"Без сложных терминов. Так, чтобы было понятно каждому.",,ep_cellular_aging_p2,
+ep_cellular_aging_2,2,4,Peter,Давайте начнем с необычного заболевания.,,ep_cellular_aging_p2,

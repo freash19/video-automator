@@ -1,0 +1,11 @@
+episode_id,part_idx,scene_idx,text,speaker,brolls,title,template_url
+ep_cellular_aging,1,1,Знаете,Peter,за тридцать пять лет практики я видел немало пациентов.,,ep_cellular_aging_p1
+ep_cellular_aging,1,2,Которые спрашивали меня: Доктор,Peter,почему один человек в шестьдесят выглядит на сорок?,,ep_cellular_aging_p1
+ep_cellular_aging,1,3,А другой в сорок — на шестьдесят?,Peter,young old man energy comparison side by side,ep_cellular_aging_p1,
+ep_cellular_aging,1,4,И честно говоря,Peter,до недавнего времени я не мог дать точный ответ.,,ep_cellular_aging_p1
+ep_cellular_aging,1,5,Говорил о генетике,Peter,образе жизни,питании.,doctor consulting elderly patient office friendly
+ep_cellular_aging,1,6,Но в ноябре две тысячи двадцать пятого года вышло исследование.,Peter,,ep_cellular_aging_p1,
+ep_cellular_aging,1,7,Которое наконец объяснило главный механизм старения.,Peter,scientific breakthrough laboratory microscope research,ep_cellular_aging_p1,
+ep_cellular_aging,1,8,И сегодня я расскажу вам об этом простым языком.,Peter,,ep_cellular_aging_p1,
+ep_cellular_aging,1,9,Без сложных терминов. Так,Peter,чтобы было понятно каждому.,,ep_cellular_aging_p1
+ep_cellular_aging,1,10,Давайте начнем с необычного заболевания.,Peter,,ep_cellular_aging_p1,

@@ -1,0 +1,47 @@
+# TRAE Rules & Project Standards
+
+This file serves as the **Global Constitution** for the HeyGen Automation project.
+All AI Agents (Architect, Developer, Reviewer) must adhere to these guidelines.
+
+## 1. Tech Stack & Environment
+- **Automation Core**: Playwright (Python async API).
+- **Backend**: Python 3.14+ (FastAPI/Uvicorn).
+- **Frontend**: React + Vite + TypeScript (Shadcn/Radix UI).
+- **Server**: Runs on `localhost:8000` (API) and `localhost:5173` (UI).
+
+## 2. Selector Strategy (Critical)
+- **Golden Rule**: Prefer `data-testid` attributes above all else.
+- **Hierarchy**:
+  1. `page.locator('[data-testid="my-id"]')`
+  2. `page.get_by_role(...)` (if text is stable)
+  3. CSS/XPath with specific attributes (e.g., `input[placeholder="Search"]`)
+- **Forbidden**: Unstable, generated classes (e.g., `.css-1x2y3z`).
+- **Action**: If `data-testid` is missing in *our* frontend, add it. If missing in HeyGen (external), use robust text/attribute selectors.
+
+## 3. Logging & Observability
+- **Requirement**: All automation runs must append logs to `automation.log` in the project root.
+- **Format**: `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Context] Message`
+- **Error Handling**:
+  - **Never** swallow errors silently.
+  - Log full stack traces for unexpected crashes.
+  - Use `try-except` blocks around volatile Playwright actions (clicks, waits).
+
+## 4. Coding Conventions
+- **Python (Backend/Automation)**:
+  - **Async/Await**: Mandatory for all I/O and Playwright calls.
+  - **Type Hints**: Required for function arguments and return types.
+  - **Structure**: Keep logic in `HeyGenAutomation` class (in `heygen_automation.py`) or separate utility modules.
+  - **Retries**: Implement explicit retry loops for network-dependent actions.
+- **TypeScript (Frontend)**:
+  - **Components**: Functional components with strict props typing.
+  - **State**: Use React hooks (`useState`, `useEffect`).
+
+## 5. Agent Workflow (The "Harness")
+- **Architect**: Before coding, verify `docs/PLAN.md` reflects the user's intent.
+- **Developer**: Modify code *only* after understanding the existing patterns. Check for existing helpers in `heygen_automation.py` (like `_try_click`, `_broll_pause`).
+- **Reviewer**: Validate that changes follow the `PLAN.md` and do not break existing functionality.
+
+## 6. Project Context
+- **Entry Point**: `heygen_automation.py` contains the main class `HeyGenAutomation`.
+- **Runner**: `ui/runner.py` manages execution queues and concurrency.
+- **Data**: CSV files in `uploads/` drive the automation scenarios.
