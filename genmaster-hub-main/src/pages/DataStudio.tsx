@@ -184,7 +184,7 @@ export default function DataStudio() {
           </p>
         </div>
         <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-muted/50">
-          <span className="text-sm text-muted-foreground">Selected:</span>
+          <span className="text-sm text-muted-foreground">Выбрано:</span>
           <span className="text-lg font-bold text-primary">{selectedCount}</span>
           <span className="text-sm text-muted-foreground">/ {data.length}</span>
         </div>

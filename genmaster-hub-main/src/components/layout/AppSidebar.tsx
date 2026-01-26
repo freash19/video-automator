@@ -1,19 +1,23 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import {
-  LayoutDashboard,
   Database,
   GitBranch,
-  FileText,
   Settings,
   Play,
   ChevronLeft,
   ChevronRight,
   Zap,
   FolderOutput,
+  FileStack,
+  CheckCircle,
+  XCircle,
+  Clock,
+  Activity,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { API_BASE_URL } from "@/lib/utils";
 import {
   Tooltip,
   TooltipContent,
@@ -21,18 +25,128 @@ import {
 } from "@/components/ui/tooltip";
 
 const navItems = [
-  { path: "/", icon: LayoutDashboard, label: "Панель", description: "Обзор и статистика" },
   { path: "/data-studio", icon: Database, label: "Студия данных", description: "Шаг 1: Импорт данных" },
   { path: "/workflow", icon: GitBranch, label: "Воркфлоу", description: "Шаг 2: Конструктор" },
-  { path: "/scripts", icon: FileText, label: "Сценарии", description: "Эпизоды и проекты" },
   { path: "/settings", icon: Settings, label: "Настройки", description: "Конфигурация" },
   { path: "/runner", icon: Play, label: "Запуск", description: "Выполнение автоматизации" },
-  { path: "/results", icon: FolderOutput, label: "Результаты", description: "Выходные видео" },
+  { path: "/results", icon: FolderOutput, label: "Видео", description: "Выходные видео" },
 ];
 
 export function AppSidebar() {
   const [collapsed, setCollapsed] = useState(false);
   const location = useLocation();
+  const API = API_BASE_URL;
+  const [stats, setStats] = useState({
+    totalEpisodes: 0,
+    completed: 0,
+    failed: 0,
+    mergedTotal: "—",
+  });
+  const [tasks, setTasks] = useState<Array<{ label: string; detail?: string }>>([]);
+
+  const parseDuration = (val: string) => {
+    const v = String(val || "").trim();
+    if (!v) return 0;
+    if (v.endsWith("s")) {
+      const n = Number(v.replace("s", ""));
+      return Number.isFinite(n) ? n : 0;
+    }
+    const parts = v.split(":").map((p) => Number(p));
+    if (parts.some((p) => Number.isNaN(p))) return 0;
+    if (parts.length === 2) {
+      return parts[0] * 60 + parts[1];
+    }
+    if (parts.length === 3) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    return 0;
+  };
+
+  const formatDuration = (seconds: number) => {
+    if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+    const s = Math.floor(seconds);
+    if (s < 60) return `${s}s`;
+    if (s < 3600) {
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return `${m}:${String(sec).padStart(2, "0")}`;
+    }
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  };
+
+  useEffect(() => {
+    if (collapsed) return;
+    const load = async () => {
+      try {
+        const [s, p, logs, vids] = await Promise.all([
+          fetch(`${API}/csv/stats`).then((r) => r.json()),
+          fetch(`${API}/progress`).then((r) => r.json()),
+          fetch(`${API}/logs?limit=200`).then((r) => r.json()),
+          fetch(`${API}/videos`).then((r) => r.json()),
+        ]);
+        const totalEpisodes = (s?.episodes || []).length || 0;
+        const done = Number(p?.done || 0);
+        const total = Number(p?.total || 0);
+        const failed = total > 0 ? Math.max(0, total - done) : 0;
+        const mergedVideos = Array.isArray(vids?.videos) ? vids.videos : [];
+        const mergedSeconds = mergedVideos.reduce((acc: number, v: Record<string, unknown>) => {
+          if (!v?.merged) return acc;
+          const sec = typeof v.duration_sec === "number" ? v.duration_sec : parseDuration(String(v.duration || ""));
+          return acc + (Number.isFinite(sec) ? sec : 0);
+        }, 0);
+        setStats({
+          totalEpisodes,
+          completed: done,
+          failed,
+          mergedTotal: formatDuration(mergedSeconds),
+        });
+
+        const running: Record<string, number> = {};
+        let mergeActive = false;
+        if (Array.isArray(logs)) {
+          logs.forEach((e) => {
+            const raw = typeof e?.msg === "string" ? e.msg : "";
+            try {
+              const msg = raw ? JSON.parse(raw) : null;
+              if (msg?.type === "start_part") {
+                running[String(msg.episode)] = Number(msg.part);
+              }
+              if (msg?.type === "finish_part") {
+                delete running[String(msg.episode)];
+              }
+            } catch {
+              if (raw.includes("merge_videos") && raw.includes("merging")) {
+                mergeActive = true;
+              }
+              if (raw.includes("merge complete")) {
+                mergeActive = false;
+              }
+            }
+          });
+        }
+
+        const taskList: Array<{ label: string; detail?: string }> = [];
+        if (total > 0 && done < total) {
+          taskList.push({ label: "Заполнение сценария", detail: `${done}/${total}` });
+        }
+        Object.entries(running).forEach(([episode, part]) => {
+          taskList.push({ label: "Эпизод в работе", detail: `${episode}, часть ${part}` });
+        });
+        if (mergeActive) {
+          taskList.push({ label: "Монтаж видео", detail: "склейка/рендер" });
+        }
+        setTasks(taskList);
+      } catch {
+        setTasks([]);
+      }
+    };
+    load();
+    const id = setInterval(load, 2000);
+    return () => clearInterval(id);
+  }, [API, collapsed]);
 
   return (
     <aside
@@ -49,7 +163,7 @@ export function AppSidebar() {
         {!collapsed && (
           <div className="flex flex-col animate-fade-in">
             <span className="text-sm font-semibold text-foreground">HeyGen</span>
-            <span className="text-xs text-muted-foreground">Automation Pro</span>
+            <span className="text-xs text-muted-foreground">Автоматизация Pro</span>
           </div>
         )}
       </div>
@@ -107,6 +221,65 @@ export function AppSidebar() {
           return <div key={item.path}>{linkContent}</div>;
         })}
       </nav>
+
+      {!collapsed && (
+        <div className="px-3 pb-3 space-y-3 border-t border-sidebar-border pt-3">
+          <div className="rounded-lg border border-border bg-muted/20 p-3">
+            <div className="text-xs font-semibold text-foreground mb-2 flex items-center gap-2">
+              <Activity className="w-3.5 h-3.5 text-primary" />
+              Статистика
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-md border border-border p-2">
+                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                  <FileStack className="w-3 h-3" />
+                  Всего
+                </div>
+                <div className="text-lg font-semibold">{stats.totalEpisodes}</div>
+              </div>
+              <div className="rounded-md border border-border p-2">
+                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                  <CheckCircle className="w-3 h-3" />
+                  Завершено
+                </div>
+                <div className="text-lg font-semibold">{stats.completed}</div>
+              </div>
+              <div className="rounded-md border border-border p-2">
+                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                  <XCircle className="w-3 h-3" />
+                  Ошибки
+                </div>
+                <div className="text-lg font-semibold">{stats.failed}</div>
+              </div>
+              <div className="rounded-md border border-border p-2">
+                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                  <Clock className="w-3 h-3" />
+                  Сумма монтажа
+                </div>
+                <div className="text-lg font-semibold">{stats.mergedTotal}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-border bg-muted/20 p-3">
+            <div className="text-xs font-semibold text-foreground mb-2">Текущие задачи</div>
+            {tasks.length === 0 ? (
+              <div className="text-xs text-muted-foreground/70 italic">Нет активных задач</div>
+            ) : (
+              <div className="space-y-2">
+                {tasks.map((t, idx) => (
+                  <div key={`${t.label}-${idx}`} className="rounded-md border border-border p-2">
+                    <div className="text-xs font-medium text-foreground">{t.label}</div>
+                    {t.detail && (
+                      <div className="text-[10px] text-muted-foreground">{t.detail}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Collapse Toggle */}
       <div className="p-3 border-t border-sidebar-border">

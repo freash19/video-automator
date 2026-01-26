@@ -57,7 +57,7 @@ export function StatCard({
               )}
             >
               <span>{trend.isPositive ? "↑" : "↓"}</span>
-              <span>{Math.abs(trend.value)}% from last batch</span>
+              <span>{Math.abs(trend.value)}% от последнего пакета</span>
             </div>
           )}
         </div>

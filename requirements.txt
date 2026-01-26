@@ -3,8 +3,11 @@ playwright
 streamlit
 python-telegram-bot
 apscheduler
-pydantic
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv
 requests
 fastapi
 uvicorn[standard]
 python-multipart
+psutil

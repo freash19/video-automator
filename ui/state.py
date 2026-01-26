@@ -209,3 +209,142 @@ def add_projects_with_records(rows: list, episodes: list | None = None) -> list:
 
     save_projects(cur)
     return get_projects()
+
+
+# Video state management
+import uuid
+
+def videos_path() -> str:
+    return os.path.join(_state_dir(), "videos.json")
+
+
+def get_videos() -> dict:
+    """Get all videos from state/videos.json"""
+    p = videos_path()
+    if os.path.isfile(p):
+        with open(p, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                return _sanitize_json_value(data) or {"videos": [], "last_scraped": None}
+            except Exception:
+                return {"videos": [], "last_scraped": None}
+    return {"videos": [], "last_scraped": None}
+
+
+def save_videos(data: dict) -> None:
+    """Save videos to state/videos.json"""
+    p = videos_path()
+    with open(p, "w", encoding="utf-8") as f:
+        sanitized = _sanitize_json_value(data)
+        json.dump(sanitized, f, ensure_ascii=False, indent=2)
+
+
+def get_video_list() -> list:
+    """Get just the videos array"""
+    return get_videos().get("videos", [])
+
+
+def add_video(video: dict) -> dict:
+    """Add a new video to the list"""
+    data = get_videos()
+    videos = data.get("videos", [])
+    
+    # Generate ID if not present
+    if not video.get("id"):
+        video["id"] = str(uuid.uuid4())
+    
+    # Check for duplicate by title or download_url
+    existing_ids = {v.get("id") for v in videos}
+    existing_titles = {v.get("title") for v in videos if v.get("title")}
+    
+    if video.get("id") in existing_ids:
+        # Update existing
+        for i, v in enumerate(videos):
+            if v.get("id") == video.get("id"):
+                videos[i] = {**v, **video}
+                break
+    elif video.get("title") in existing_titles:
+        # Update by title match
+        for i, v in enumerate(videos):
+            if v.get("title") == video.get("title"):
+                videos[i] = {**v, **video}
+                video["id"] = v.get("id")
+                break
+    else:
+        videos.append(video)
+    
+    data["videos"] = videos
+    save_videos(data)
+    return video
+
+
+def update_video(video_id: str, updates: dict) -> dict | None:
+    """Update a video by ID"""
+    data = get_videos()
+    videos = data.get("videos", [])
+    
+    for i, v in enumerate(videos):
+        if v.get("id") == video_id:
+            videos[i] = {**v, **updates}
+            data["videos"] = videos
+            save_videos(data)
+            return videos[i]
+    
+    return None
+
+
+def delete_video(video_id: str) -> bool:
+    """Delete a video by ID"""
+    data = get_videos()
+    videos = data.get("videos", [])
+    
+    original_len = len(videos)
+    videos = [v for v in videos if v.get("id") != video_id]
+    
+    if len(videos) < original_len:
+        data["videos"] = videos
+        save_videos(data)
+        return True
+    
+    return False
+
+
+def clear_videos() -> None:
+    """Clear all videos"""
+    save_videos({"videos": [], "last_scraped": None})
+
+
+def set_last_scraped() -> None:
+    """Update the last_scraped timestamp"""
+    data = get_videos()
+    data["last_scraped"] = _now_iso()
+    save_videos(data)
+
+
+def bulk_add_videos(videos: list) -> list:
+    """Add multiple videos at once, avoiding duplicates by title"""
+    data = get_videos()
+    existing = data.get("videos", [])
+    existing_titles = {v.get("title") for v in existing if v.get("title")}
+    
+    added = []
+    for video in videos:
+        if not video.get("id"):
+            video["id"] = str(uuid.uuid4())
+        
+        if video.get("title") not in existing_titles:
+            existing.append(video)
+            existing_titles.add(video.get("title"))
+            added.append(video)
+        else:
+            # Update existing video with same title
+            for i, v in enumerate(existing):
+                if v.get("title") == video.get("title"):
+                    existing[i] = {**v, **video, "id": v.get("id")}
+                    added.append(existing[i])
+                    break
+    
+    data["videos"] = existing
+    data["last_scraped"] = _now_iso()
+    save_videos(data)
+    return added

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Play, Square, Pause, RefreshCw, AlertTriangle, Trash2 } from "lucide-react";
+import { Play, Square, Pause, RefreshCw, AlertTriangle, Trash2, Monitor } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { API_BASE_URL, cn, formatDateTimeRu, projectStatusRu } from "@/lib/utils";
@@ -39,6 +39,15 @@ interface RunnerTask {
   scene_done?: number;
   scene_total?: number;
   report?: Record<string, unknown> | null;
+  report_details?: Record<string, Array<Record<string, unknown>>> | null;
+}
+
+interface TaskStatusDetails {
+  steps?: Array<{
+    name: string;
+    status: string;
+    error_message?: string | null;
+  }>;
 }
 
 export function RunnerControls() {
@@ -60,6 +69,13 @@ export function RunnerControls() {
   const [searchParams] = useSearchParams();
   const [tasks, setTasks] = useState<RunnerTask[]>([]);
   const lastTaskStatusRef = useRef<Record<string, TaskStatus>>({});
+  const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
+  const [taskStatuses, setTaskStatuses] = useState<Record<string, TaskStatusDetails>>({});
+  const [pendingDelete, setPendingDelete] = useState<{ episode: string; expiresAt: number } | null>(null);
+  const pendingDeleteTimerRef = useRef<number | null>(null);
+  const [profiles, setProfiles] = useState<string[]>([]);
+  const [selectedProfile, setSelectedProfile] = useState<string>("ask");
+  const [browserEngine, setBrowserEngine] = useState<"chrome" | "chromium">("chrome");
 
   const queryEpisodes = useMemo(() => {
     const raw = (searchParams.get("episodes") || "").trim();
@@ -96,6 +112,52 @@ export function RunnerControls() {
     }
   }, []);
 
+  const updateBrowserConfig = useCallback(async () => {
+    try {
+      const cfg = await fetch(`${API}/config`).then((r) => r.json());
+      const profiles = cfg?.profiles || {};
+      const profile = profiles[selectedProfile] as { cdp_url?: string; browser_type?: string } | undefined;
+      
+      let chromeCdpUrl = cfg?.chrome_cdp_url || "http://localhost:9222";
+      let forceEmbedded = browserEngine === "chromium";
+      
+      // Use profile settings if available
+      if (profile && selectedProfile) {
+        const profileBrowserType = profile.browser_type || (profile.cdp_url ? "chrome" : "chromium");
+        
+        if (profileBrowserType === "chrome" && profile.cdp_url) {
+          chromeCdpUrl = profile.cdp_url;
+          forceEmbedded = false;
+        } else if (profileBrowserType === "chromium") {
+          forceEmbedded = true;
+        } else {
+          // Fallback: use manual selection
+          forceEmbedded = browserEngine === "chromium";
+          if (profile.cdp_url) {
+            chromeCdpUrl = profile.cdp_url;
+          }
+        }
+      } else {
+        // No profile selected - use manual selection
+        forceEmbedded = browserEngine === "chromium";
+      }
+      
+      await fetch(`${API}/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          profile_to_use: selectedProfile || (Object.keys(profiles)[0] || ""),
+          browser: "chrome",
+          chrome_cdp_url: chromeCdpUrl,
+          force_embedded_browser: forceEmbedded,
+          multilogin_cdp_url: "",
+        }),
+      });
+    } catch {
+      // ignore
+    }
+  }, [API, browserEngine, selectedProfile]);
+
   const startEpisodes = useCallback(
     async (episodes: string[]) => {
       const eps = episodes.filter(Boolean);
@@ -104,6 +166,7 @@ export function RunnerControls() {
         return;
       }
       try {
+        await updateBrowserConfig();
         const res = await fetch(`${API}/run/projects`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -118,7 +181,7 @@ export function RunnerControls() {
         toast.error("Не удалось запустить проекты");
       }
     },
-    [API, selectedWf]
+    [API, selectedWf, updateBrowserConfig]
   );
 
   const handleStart = useCallback(() => {
@@ -149,7 +212,7 @@ export function RunnerControls() {
       list.forEach((p) => {
         const ep = p.episode;
         if (!ep) return;
-        next[ep] = prev[ep] ?? true;
+        next[ep] = prev[ep] ?? false;
       });
       return next;
     });
@@ -173,6 +236,20 @@ export function RunnerControls() {
       setTotalScenes(0);
     });
   };
+
+  const handleOpenBrowser = useCallback(async () => {
+    try {
+      await updateBrowserConfig();
+      const res = await fetch(`${API}/browser/open`, { method: "POST" });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(t || `HTTP ${res.status}`);
+      }
+      toast.success("Браузер открыт");
+    } catch (e) {
+      toast.error("Не удалось открыть браузер");
+    }
+  }, [API, updateBrowserConfig]);
 
   const isRunning = state === "running" || state === "paused";
   const selectedCount = useMemo(() => {
@@ -203,9 +280,157 @@ export function RunnerControls() {
     });
   }, [projects]);
 
+  const clearPendingDelete = useCallback(() => {
+    if (pendingDeleteTimerRef.current) {
+      window.clearTimeout(pendingDeleteTimerRef.current);
+      pendingDeleteTimerRef.current = null;
+    }
+    setPendingDelete(null);
+  }, []);
+
+  const executeDelete = useCallback(
+    async (episode: string) => {
+      try {
+        const res = await fetch(`${API}/projects/${encodeURIComponent(episode)}`, { method: "DELETE" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        toast.success("Проект удалён");
+        await reloadProjects();
+      } catch (e) {
+        toast.error("Не удалось удалить проект");
+      }
+    },
+    [API, reloadProjects]
+  );
+
+  const scheduleDelete = useCallback(
+    (episode: string) => {
+      clearPendingDelete();
+      setPendingDelete({ episode, expiresAt: Date.now() + 5000 });
+      pendingDeleteTimerRef.current = window.setTimeout(() => {
+        pendingDeleteTimerRef.current = null;
+        setPendingDelete(null);
+        void executeDelete(episode);
+      }, 5000);
+      toast.success("Удаление запланировано на 5 секунд");
+    },
+    [clearPendingDelete, executeDelete]
+  );
+
+  const projectStatusBadgeClass = useCallback((status: string) => {
+    const s = String(status || "").toLowerCase();
+    if (s === "completed" || s === "success") return "bg-success/15 text-success border-success/30";
+    if (s === "running") return "bg-primary/15 text-primary border-primary/30";
+    if (s === "failed") return "bg-destructive/15 text-destructive border-destructive/30";
+    if (s === "pending") return "bg-muted text-muted-foreground border-border";
+    return "bg-muted text-muted-foreground border-border";
+  }, []);
+
+  const summarizeReport = useCallback((task: RunnerTask) => {
+    const rep = task.report;
+    const labels: Record<string, string> = {
+      validation_missing: "несоответствия",
+      broll_skipped: "b-roll пропущен",
+      broll_no_results: "b-roll без результатов",
+      broll_errors: "ошибки b-roll",
+      manual_intervention: "вмешательство",
+    };
+    if (!rep || typeof rep !== "object") {
+      if (task.status === "success") return { text: "Отчёт: ошибок нет", tone: "ok" };
+      if (task.status === "failed") return { text: "Отчёт: нет данных", tone: "error" };
+      return { text: "Отчёт: —", tone: "muted" };
+    }
+    const items = Object.entries(rep)
+      .map(([k, v]) => ({
+        key: k,
+        count: Number(v ?? 0),
+      }))
+      .filter((i) => Number.isFinite(i.count) && i.count > 0);
+    if (items.length === 0) {
+      return { text: "Отчёт: ошибок нет", tone: "ok" };
+    }
+    const parts = items.map((i) => `${labels[i.key] || i.key}: ${i.count}`);
+    return { text: `Отчёт: ${parts.join(", ")}`, tone: "error" };
+  }, []);
+
+  const extractSceneList = useCallback((items?: Array<Record<string, unknown>>) => {
+    if (!items || items.length === 0) return "";
+    const scenes = items
+      .map((i) => (typeof i?.scene_idx === "number" || typeof i?.scene_idx === "string" ? String(i.scene_idx) : ""))
+      .filter(Boolean);
+    return scenes.join(", ");
+  }, []);
+
+  const renderReportDetails = useCallback(
+    (task: RunnerTask) => {
+      const details = task.report_details;
+      if (!details) return null;
+      const missing = extractSceneList(details.validation_missing);
+      const brollSkipped = extractSceneList(details.broll_skipped);
+      const brollNoResults = extractSceneList(details.broll_no_results);
+      const brollErrors = extractSceneList(details.broll_errors);
+      const manual = extractSceneList(details.manual_intervention);
+      const lines = [
+        missing ? `Незаполненные сцены: ${missing}` : "",
+        brollNoResults ? `B-roll без результатов: ${brollNoResults}` : "",
+        brollErrors ? `B-roll ошибки: ${brollErrors}` : "",
+        brollSkipped ? `B-roll пропущен: ${brollSkipped}` : "",
+        manual ? `Ручные подтверждения: ${manual}` : "",
+      ].filter(Boolean);
+      if (lines.length === 0) return null;
+      return (
+        <div className="text-xs text-muted-foreground space-y-0.5">
+          {lines.map((line) => (
+            <div key={line} className="truncate">{line}</div>
+          ))}
+        </div>
+      );
+    },
+    [extractSceneList]
+  );
+
+  const toggleTaskDetails = useCallback(
+    async (task: RunnerTask) => {
+      setExpandedTasks((prev) => ({ ...prev, [task.key]: !prev[task.key] }));
+      if (expandedTasks[task.key]) return;
+      if (taskStatuses[task.key]) return;
+      try {
+        const res = await fetch(`${API}/task/${encodeURIComponent(task.key)}/status`);
+        if (!res.ok) return;
+        const data = (await res.json()) as TaskStatusDetails;
+        setTaskStatuses((prev) => ({ ...prev, [task.key]: data }));
+      } catch (e) {
+        void e;
+      }
+    },
+    [API, expandedTasks, taskStatuses]
+  );
+
   useEffect(() => {
     const loadWf = async () => {
       try {
+        const cfg = await fetch(`${API}/config`).then((r) => r.json());
+        const prof = cfg?.profiles || {};
+        const profileNames = Object.keys(prof || {}).filter(Boolean);
+        setProfiles(profileNames);
+        
+        const currentProfile = String(cfg?.profile_to_use || "").trim();
+        const validProfile = profileNames.includes(currentProfile) ? currentProfile : (profileNames[0] || "");
+        setSelectedProfile(validProfile);
+        
+        // Determine browser engine from profile or config
+        if (validProfile && prof[validProfile]) {
+          const profile = prof[validProfile] as { cdp_url?: string; browser_type?: string };
+          if (profile.browser_type === "chromium") {
+            setBrowserEngine("chromium");
+          } else if (profile.browser_type === "chrome" || profile.cdp_url) {
+            setBrowserEngine("chrome");
+          } else {
+            setBrowserEngine("chromium");
+          }
+        } else {
+          setBrowserEngine(cfg?.force_embedded_browser ? "chromium" : "chrome");
+        }
+
         const res: { files?: string[] } = await fetch(`${API}/workflows`).then((r) => r.json());
         const files = (res.files || []).filter(Boolean);
         setWorkflows(files);
@@ -256,6 +481,10 @@ export function RunnerControls() {
         }
         lastTaskStatusRef.current = prev;
         setTasks(slice);
+        const hasActive = slice.some((t) => ["running", "paused", "queued"].includes(t.status));
+        if (!hasActive && state !== "idle" && state !== "completed") {
+          setState("idle");
+        }
       } catch (e) {
         // silent
       }
@@ -263,7 +492,15 @@ export function RunnerControls() {
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [API, projectFilter, reloadProjects, sendBrowserNotification]);
+  }, [API, projectFilter, reloadProjects, sendBrowserNotification, state]);
+
+  useEffect(() => {
+    return () => {
+      if (pendingDeleteTimerRef.current) {
+        window.clearTimeout(pendingDeleteTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (initialSelectionApplied) return;
@@ -293,66 +530,131 @@ export function RunnerControls() {
   return (
     <div className="rounded-xl border border-border shadow-card p-6 space-y-6">
       {/* Controls */}
-      <div className="flex items-center gap-3">
-        <Select value={selectedWf} onValueChange={setSelectedWf}>
-          <SelectTrigger className="w-[240px]">
-            <SelectValue placeholder="Файл воркфлоу" />
-          </SelectTrigger>
-          <SelectContent>
-            {workflows.map((f) => (
-              <SelectItem key={f} value={f}>{f}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={projectFilter} onValueChange={(v) => setProjectFilter(v)}>
-          <SelectTrigger className="w-[200px]">
-            <SelectValue placeholder="Фильтр проектов" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">Все</SelectItem>
-            <SelectItem value="pending">В ожидании</SelectItem>
-            <SelectItem value="running">В работе</SelectItem>
-            <SelectItem value="completed">Завершён</SelectItem>
-            <SelectItem value="failed">Ошибка</SelectItem>
-          </SelectContent>
-        </Select>
-        <Button
-          size="lg"
-          variant={state === "running" ? "secondary" : "glow"}
-          onClick={handleStart}
-          disabled={state === "running"}
-          className="flex-1"
-        >
-          <Play className="w-5 h-5 mr-2" />
-          {state === "idle"
-            ? "ЗАПУСТИТЬ"
-            : state === "paused"
-              ? "ПРОДОЛЖИТЬ"
-              : state === "completed"
+      <div className="flex items-start gap-6">
+        <div className="flex-1 space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <Button
+              size="lg"
+              variant={state === "running" ? "secondary" : "glow"}
+              onClick={handleStart}
+              disabled={state === "running"}
+              className="min-w-[200px]"
+            >
+              <Play className="w-5 h-5 mr-2" />
+              {state === "idle"
                 ? "ЗАПУСТИТЬ"
-                : "ВЫПОЛНЯЕТСЯ..."}
-        </Button>
+                : state === "paused"
+                  ? "ПРОДОЛЖИТЬ"
+                  : state === "completed"
+                    ? "ЗАПУСТИТЬ"
+                    : "ВЫПОЛНЯЕТСЯ..."}
+            </Button>
 
-        <Button
-          size="lg"
-          variant="outline"
-          onClick={handlePause}
-          disabled={!isRunning}
-          className={cn(state === "paused" && "border-warning text-warning")}
-        >
-          <Pause className="w-5 h-5" />
-        </Button>
+            <Button
+              size="lg"
+              variant="destructive"
+              onClick={handleStop}
+              disabled={!isRunning}
+              className="shadow-lg shadow-destructive/20"
+            >
+              <Square className="w-5 h-5 mr-2" />
+              ОСТАНОВИТЬ
+            </Button>
 
-        <Button
-          size="lg"
-          variant="destructive"
-          onClick={handleStop}
-          disabled={!isRunning}
-          className="shadow-lg shadow-destructive/20"
-        >
-          <Square className="w-5 h-5 mr-2" />
-          ОСТАНОВИТЬ
-        </Button>
+            <Button
+              size="icon"
+              variant="outline"
+              onClick={handleOpenBrowser}
+              aria-label="Открыть браузер"
+              data-testid="open-browser-button"
+            >
+              <Monitor className="w-5 h-5" />
+            </Button>
+
+            <Button
+              size="lg"
+              variant="outline"
+              onClick={handlePause}
+              disabled={!isRunning}
+              className={cn(state === "paused" && "border-warning text-warning")}
+            >
+              <Pause className="w-5 h-5" />
+            </Button>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <Select value={selectedWf} onValueChange={setSelectedWf}>
+              <SelectTrigger className="w-[180px]">
+                <SelectValue placeholder="Файл воркфлоу" />
+              </SelectTrigger>
+              <SelectContent>
+                {workflows.map((f) => (
+                  <SelectItem key={f} value={f}>{f}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={selectedProfile} onValueChange={(v) => {
+              setSelectedProfile(v);
+              // Auto-update browser engine based on profile
+              fetch(`${API}/config`).then((r) => r.json()).then((config) => {
+                const profile = config?.profiles?.[v];
+                if (profile?.cdp_url) {
+                  setBrowserEngine("chrome");
+                } else {
+                  setBrowserEngine("chromium");
+                }
+              }).catch(() => {});
+            }}>
+              <SelectTrigger className="w-[150px]">
+                <SelectValue placeholder="Профиль браузера" />
+              </SelectTrigger>
+              <SelectContent>
+                {profiles.map((p) => (
+                  <SelectItem key={p} value={p}>{p}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select 
+              value={browserEngine} 
+              onValueChange={(v) => setBrowserEngine(v as "chrome" | "chromium")}
+            >
+              <SelectTrigger className="w-[120px]">
+                <SelectValue placeholder="Браузер" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="chrome">Chrome (CDP)</SelectItem>
+                <SelectItem value="chromium">Chromium (встроенный)</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <div className="shrink-0">
+          <div
+            className={cn(
+              "w-[280px] flex items-center justify-center gap-2 py-3 rounded-lg border",
+              state === "running" && "border-primary/30 bg-primary/5 text-primary",
+              state === "paused" && "border-warning/30 bg-warning/5 text-warning",
+              state === "idle" && "border-border bg-muted/30 text-muted-foreground",
+              state === "completed" && "border-success/30 bg-success/5 text-success"
+            )}
+          >
+            {state === "running" && (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                <span className="font-medium">Обработка эпизодов...</span>
+              </>
+            )}
+            {state === "paused" && (
+              <>
+                <AlertTriangle className="w-4 h-4" />
+                <span className="font-medium">Пауза — нажмите «Продолжить»</span>
+              </>
+            )}
+            {state === "idle" && <span className="font-medium">Готово к запуску</span>}
+            {state === "completed" && <span className="font-medium">Пакет завершён!</span>}
+          </div>
+        </div>
       </div>
 
       {/* Progress */}
@@ -368,31 +670,7 @@ export function RunnerControls() {
         </div>
       </div>
 
-      {/* Status Indicator */}
-      <div
-        className={cn(
-          "flex items-center justify-center gap-2 py-3 rounded-lg border",
-          state === "running" && "border-primary/30 bg-primary/5 text-primary",
-          state === "paused" && "border-warning/30 bg-warning/5 text-warning",
-          state === "idle" && "border-border bg-muted/30 text-muted-foreground",
-          state === "completed" && "border-success/30 bg-success/5 text-success"
-        )}
-      >
-        {state === "running" && (
-          <>
-            <RefreshCw className="w-4 h-4 animate-spin" />
-            <span className="font-medium">Обработка эпизодов...</span>
-          </>
-        )}
-        {state === "paused" && (
-          <>
-            <AlertTriangle className="w-4 h-4" />
-            <span className="font-medium">Пауза — нажмите «Продолжить»</span>
-          </>
-        )}
-        {state === "idle" && <span className="font-medium">Готово к запуску</span>}
-        {state === "completed" && <span className="font-medium">Пакет завершён!</span>}
-      </div>
+      {/* Status Indicator moved to top-right */}
 
       <div className="rounded-lg border border-border p-4">
         <div className="text-sm font-semibold text-foreground mb-2">Задачи</div>
@@ -401,9 +679,45 @@ export function RunnerControls() {
             <div key={t.key} className="flex items-center justify-between gap-3 py-2 border-b border-border/60 last:border-b-0">
               <div className="min-w-0">
                 <div className="text-sm font-mono text-foreground truncate">{t.episode}</div>
-                <div className="text-xs text-muted-foreground">part {t.part}</div>
+                <div className="text-xs text-muted-foreground">часть {t.part}</div>
                 {t.stage && <div className="text-xs text-muted-foreground truncate">Этап: {t.stage}</div>}
                 {t.error && <div className="text-xs text-destructive truncate">Ошибка: {t.error}</div>}
+                {(() => {
+                  const rep = summarizeReport(t);
+                  if (!rep?.text) return null;
+                  return (
+                    <div
+                      className={cn(
+                        "text-xs truncate",
+                        rep.tone === "ok" && "text-success",
+                        rep.tone === "error" && "text-destructive",
+                        rep.tone === "muted" && "text-muted-foreground"
+                      )}
+                    >
+                      {rep.text}
+                    </div>
+                  );
+                })()}
+                {renderReportDetails(t)}
+                {expandedTasks[t.key] && (() => {
+                  const detail = taskStatuses[t.key];
+                  const steps = detail?.steps || [];
+                  const failed = steps.filter((s) => s.status === "failed");
+                  const skipped = steps.filter((s) => s.status === "skipped");
+                  if (failed.length === 0 && skipped.length === 0) return null;
+                  return (
+                    <div className="text-xs text-muted-foreground space-y-0.5">
+                      {failed.length > 0 && (
+                        <div className="text-destructive truncate">
+                          Шаги с ошибкой: {failed.map((s) => s.error_message ? `${s.name} (${s.error_message})` : s.name).join(", ")}
+                        </div>
+                      )}
+                      {skipped.length > 0 && (
+                        <div className="truncate">Пропущенные шаги: {skipped.map((s) => s.name).join(", ")}</div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <div
@@ -429,6 +743,14 @@ export function RunnerControls() {
                             ? "ОШИБКА"
                             : "ОСТАНОВЛЕНО"}
                 </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="task-details-toggle"
+                  onClick={() => void toggleTaskDetails(t)}
+                >
+                  {expandedTasks[t.key] ? "Скрыть" : "Детали"}
+                </Button>
                 <div className="flex items-center gap-1">
                   <Button
                     variant="outline"
@@ -477,6 +799,18 @@ export function RunnerControls() {
         <div className="flex items-center justify-between gap-3 mb-2">
           <div className="text-sm font-semibold text-foreground">Проекты к запуску</div>
           <div className="flex items-center gap-2">
+            <Select value={projectFilter} onValueChange={(v) => setProjectFilter(v)}>
+              <SelectTrigger className="w-[180px]">
+                <SelectValue placeholder="Фильтр проектов" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Все</SelectItem>
+                <SelectItem value="pending">В ожидании</SelectItem>
+                <SelectItem value="running">В работе</SelectItem>
+                <SelectItem value="completed">Завершён</SelectItem>
+                <SelectItem value="failed">Ошибка</SelectItem>
+              </SelectContent>
+            </Select>
             <div className="text-xs text-muted-foreground">
               {selectedCount} / {projects.length}
             </div>
@@ -488,20 +822,37 @@ export function RunnerControls() {
             </Button>
           </div>
         </div>
+        {pendingDelete && (
+          <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+            <div className="truncate">
+              Проект будет удалён через 5 секунд: <span className="font-mono">{pendingDelete.episode}</span>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                clearPendingDelete();
+                toast.success("Удаление отменено");
+              }}
+            >
+              Отменить
+            </Button>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {projects.map((pr) => (
             <div
               key={pr.episode}
               className={cn(
-                "p-3 rounded-lg border bg-muted/20 transition-colors cursor-pointer",
-                selectedEpisodes[pr.episode] ? "border-primary/30 bg-primary/5" : "hover:bg-muted/30"
+                "p-3 rounded-lg border bg-muted/20 transition-colors cursor-pointer relative",
+                selectedEpisodes[pr.episode] ? "border-primary/30 bg-primary/5" : "hover:bg-muted/30",
+                (pr.status === "completed" || pr.status === "success") && "border-success/40 bg-success/10"
               )}
               onClick={() => toggleEpisode(pr.episode)}
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-sm font-mono text-foreground truncate">{pr.episode}</div>
-                  <div className="text-xs text-muted-foreground">{projectStatusRu(pr.status)}</div>
                   {pr.created_at && (
                     <div className="text-xs text-muted-foreground">Добавлено: {formatDateTimeRu(pr.created_at)}</div>
                   )}
@@ -523,7 +874,7 @@ export function RunnerControls() {
               </div>
               {pr.stats?.speakers && pr.stats.speakers.length > 0 && (
                 <div className="mt-1 text-xs text-muted-foreground truncate">
-                  <span className="text-base font-semibold text-muted-foreground">Спикер: {pr.stats.speakers.join(", ")}</span>
+                  <span className="text-base font-semibold text-foreground">Спикер: {pr.stats.speakers.join(", ")}</span>
                 </div>
               )}
               <div className="mt-3 flex items-center gap-2">
@@ -569,17 +920,10 @@ export function RunnerControls() {
                     </AlertDialogHeader>
                     <AlertDialogFooter>
                       <AlertDialogCancel>Отмена</AlertDialogCancel>
-                <AlertDialogAction
+                      <AlertDialogAction
                         className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                         onClick={async () => {
-                          try {
-                            const res = await fetch(`${API}/projects/${encodeURIComponent(pr.episode)}`, { method: "DELETE" });
-                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                            toast.success("Проект удалён");
-                            await reloadProjects();
-                          } catch (e) {
-                            toast.error("Не удалось удалить проект");
-                          }
+                          scheduleDelete(pr.episode);
                         }}
                       >
                         Удалить
@@ -587,6 +931,15 @@ export function RunnerControls() {
                     </AlertDialogFooter>
                   </AlertDialogContent>
                 </AlertDialog>
+              </div>
+              <div
+                data-testid="project-status-badge"
+                className={cn(
+                  "absolute bottom-2 right-2 text-[11px] font-medium px-2 py-1 rounded-full border",
+                  projectStatusBadgeClass(pr.status)
+                )}
+              >
+                {projectStatusRu(pr.status)}
               </div>
             </div>
           ))}

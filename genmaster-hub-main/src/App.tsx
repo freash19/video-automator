@@ -3,12 +3,10 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppLayout } from "@/components/layout/AppLayout";
-import Dashboard from "@/pages/Dashboard";
 import DataStudio from "@/pages/DataStudio";
 import Workflow from "@/pages/Workflow";
-import Scripts from "@/pages/Scripts";
 import Settings from "@/pages/Settings";
 import Runner from "@/pages/Runner";
 import Results from "@/pages/Results";
@@ -36,10 +34,9 @@ const App = () => {
         <BrowserRouter>
           <AppLayout>
             <Routes>
-              <Route path="/" element={<Dashboard />} />
+              <Route path="/" element={<Navigate to="/runner" replace />} />
               <Route path="/data-studio" element={<DataStudio />} />
               <Route path="/workflow" element={<Workflow />} />
-              <Route path="/scripts" element={<Scripts />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="/runner" element={<Runner />} />
               <Route path="/results" element={<Results />} />

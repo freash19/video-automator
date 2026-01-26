@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { API_BASE_URL } from "@/lib/utils";
+import { toast } from "sonner";
 
 type WorkflowStep = {
   id: string;
@@ -31,6 +32,8 @@ export default function Workflow() {
   const [wfJsonOpen, setWfJsonOpen] = useState<boolean>(false);
   const [wfJsonDraft, setWfJsonDraft] = useState<string>("");
   const [wfJsonError, setWfJsonError] = useState<string>("");
+  const [inspectorUrl, setInspectorUrl] = useState<string>("https://app.heygen.com/projects");
+  const [inspectorTarget, setInspectorTarget] = useState<string>("");
 
   useEffect(() => {
     const loadFiles = async () => {
@@ -153,7 +156,7 @@ export default function Workflow() {
           <h1 className="text-3xl font-bold tracking-tight text-foreground">
             Воркфлоу и локаторы
           </h1>
-          <Badge variant="secondary" className="text-xs">Step 2</Badge>
+          <Badge variant="secondary" className="text-xs">Шаг 2</Badge>
         </div>
         <p className="text-muted-foreground">
           Выберите UI‑элементы и создайте сценарий автоматизации.
@@ -225,6 +228,44 @@ export default function Workflow() {
               Обновить локаторы
             </Button>
           </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={inspectorUrl}
+              onChange={(e) => setInspectorUrl(e.target.value)}
+              placeholder="URL для инспектора"
+              className="max-w-[360px]"
+            />
+            <Input
+              value={inspectorTarget}
+              onChange={(e) => setInspectorTarget(e.target.value)}
+              placeholder="Цель (опционально)"
+              className="max-w-[240px]"
+            />
+            <Button
+              variant="outline"
+              onClick={async () => {
+                try {
+                  const res = await fetch(`${API}/inspector/start`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      url: inspectorUrl.trim(),
+                      target: inspectorTarget.trim(),
+                    }),
+                  });
+                  if (!res.ok) {
+                    const msg = await res.text().catch(() => "");
+                    throw new Error(msg || `HTTP ${res.status}`);
+                  }
+                  toast.success("Инспектор запущен");
+                } catch (e) {
+                  toast.error("Не удалось запустить инспектор");
+                }
+              }}
+            >
+              Запустить инспектор
+            </Button>
+          </div>
         </div>
         <p className="text-xs text-muted-foreground mt-2">
           Выберите сохранённый воркфлоу, редактируйте шаги и параметры, затем сохраните. Каждый шаг можно включать/выключать, менять порядок, параметры принимают JSON.
@@ -234,7 +275,7 @@ export default function Workflow() {
             <textarea
               className="w-full px-3 py-2 rounded bg-muted/30 text-xs font-mono"
               rows={3}
-              placeholder="Import from Automa: paste exported JSON here"
+              placeholder="Импорт из Automa: вставьте экспортированный JSON"
               value={automaJson}
               onChange={(e) => setAutomaJson(e.target.value)}
             />

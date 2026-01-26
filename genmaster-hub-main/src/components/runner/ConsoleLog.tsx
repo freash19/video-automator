@@ -22,11 +22,11 @@ const levelStyles = {
 };
 
 const levelPrefix = {
-  info: "INFO",
-  success: "✓ OK",
-  warning: "WARN",
-  error: "ERR!",
-  debug: "DBG",
+  info: "ИНФО",
+  success: "✓ ОК",
+  warning: "ПРЕД",
+  error: "ОШИБ",
+  debug: "ОТЛАД",
 };
 
 export function ConsoleLog() {

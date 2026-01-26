@@ -13,9 +13,9 @@ interface WizardNavigationProps {
 
 export function WizardNavigation({
   backPath,
-  backLabel = "Back",
+  backLabel = "Назад",
   nextPath,
-  nextLabel = "Next",
+  nextLabel = "Далее",
   onNext,
   nextDisabled = false,
 }: WizardNavigationProps) {

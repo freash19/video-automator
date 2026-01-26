@@ -55,22 +55,22 @@ interface Props {
 }
 
 const STEP_TYPE_OPTIONS: { value: string; label: string }[] = [
-  { value: "navigate", label: "Navigate" },
-  { value: "wait_for", label: "Wait For Selector" },
-  { value: "wait", label: "Wait (Sleep)" },
-  { value: "click", label: "Click" },
-  { value: "fill", label: "Fill" },
-  { value: "press", label: "Press Key" },
-  { value: "select_episode_parts", label: "Select Episode Parts" },
-  { value: "fill_scene", label: "Fill All Scenes" },
-  { value: "delete_empty_scenes", label: "Delete Empty Scenes" },
-  { value: "save", label: "Save" },
-  { value: "reload", label: "Reload" },
-  { value: "reload_and_validate", label: "Reload And Validate" },
-  { value: "handle_broll", label: "Handle B-Roll" },
-  { value: "generate", label: "Generate" },
-  { value: "final_submit", label: "Final Submit" },
-  { value: "confirm", label: "Confirm" },
+  { value: "navigate", label: "Переход" },
+  { value: "wait_for", label: "Ожидание селектора" },
+  { value: "wait", label: "Пауза" },
+  { value: "click", label: "Клик" },
+  { value: "fill", label: "Ввод" },
+  { value: "press", label: "Нажатие клавиши" },
+  { value: "select_episode_parts", label: "Выбор частей эпизода" },
+  { value: "fill_scene", label: "Заполнить все сцены" },
+  { value: "delete_empty_scenes", label: "Удалить пустые сцены" },
+  { value: "save", label: "Сохранить" },
+  { value: "reload", label: "Перезагрузить" },
+  { value: "reload_and_validate", label: "Перезагрузить и проверить" },
+  { value: "handle_broll", label: "B-roll" },
+  { value: "generate", label: "Сгенерировать" },
+  { value: "final_submit", label: "Финальная отправка" },
+  { value: "confirm", label: "Подтвердить" },
 ];
 
 const WAIT_UNTIL_OPTIONS = ["domcontentloaded", "load", "networkidle"] as const;
@@ -207,7 +207,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
           <div className="md:col-span-2">
             <Input
-              placeholder="URL (leave empty to use template_url)"
+              placeholder="URL (оставьте пустым для template_url)"
               value={url}
               onChange={(e) => {
                 const v = e.target.value;
@@ -232,7 +232,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
             </SelectContent>
           </Select>
           <Input
-            placeholder="timeout_ms (e.g. 120000)"
+            placeholder="timeout_ms (например 120000)"
             value={timeoutMs}
             onChange={(e) => {
               const v = e.target.value.trim();
@@ -258,7 +258,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               }}
             >
               <SelectTrigger>
-                <SelectValue placeholder="Selector from library" />
+                <SelectValue placeholder="Селектор из библиотеки" />
               </SelectTrigger>
               <SelectContent>
                 {locators.map((l) => (
@@ -274,7 +274,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
             onValueChange={(v) => setParam(index, "state", v)}
           >
             <SelectTrigger>
-              <SelectValue placeholder="state" />
+              <SelectValue placeholder="состояние" />
             </SelectTrigger>
             <SelectContent>
               {WAIT_STATE_OPTIONS.map((v) => (
@@ -285,7 +285,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
             </SelectContent>
           </Select>
           <Input
-            placeholder="timeout_ms (e.g. 30000)"
+            placeholder="timeout_ms (например 30000)"
             value={timeoutMs}
             onChange={(e) => {
               const v = e.target.value.trim();
@@ -302,7 +302,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
       return (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
           <Input
-            placeholder="sec (e.g. 1.5)"
+            placeholder="сек (например 1.5)"
             value={sec}
             onChange={(e) => {
               const v = e.target.value.trim();
@@ -330,7 +330,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               }}
             >
               <SelectTrigger>
-                <SelectValue placeholder="Selector from library" />
+              <SelectValue placeholder="Селектор из библиотеки" />
               </SelectTrigger>
               <SelectContent>
                 {locators.map((l) => (
@@ -350,17 +350,17 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
             }}
           >
             <SelectTrigger>
-              <SelectValue placeholder="which" />
+              <SelectValue placeholder="позиция" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="first">first</SelectItem>
-              <SelectItem value="last">last</SelectItem>
-              <SelectItem value="nth">nth</SelectItem>
+              <SelectItem value="first">первый</SelectItem>
+              <SelectItem value="last">последний</SelectItem>
+              <SelectItem value="nth">n-й</SelectItem>
             </SelectContent>
           </Select>
           {whichMode === "nth" ? (
             <Input
-              placeholder="nth index (0-based)"
+              placeholder="индекс n (с 0)"
               value={nth}
               onChange={(e) => {
                 const v = e.target.value.trim();
@@ -370,7 +370,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
             />
           ) : (
             <Input
-              placeholder="timeout_ms (optional)"
+              placeholder="timeout_ms (опционально)"
               value={timeoutMs}
               onChange={(e) => {
                 const v = e.target.value.trim();
@@ -381,7 +381,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
           )}
           {whichMode === "nth" && (
             <Input
-              placeholder="timeout_ms (optional)"
+              placeholder="timeout_ms (опционально)"
               value={timeoutMs}
               onChange={(e) => {
                 const v = e.target.value.trim();
@@ -407,7 +407,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               }}
             >
               <SelectTrigger>
-                <SelectValue placeholder="Selector from library" />
+              <SelectValue placeholder="Селектор из библиотеки" />
               </SelectTrigger>
               <SelectContent>
                 {locators.map((l) => (
@@ -421,7 +421,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
           <textarea
             className="md:col-span-2 px-2 py-2 rounded bg-muted/30 text-sm"
             rows={2}
-            placeholder="Text (supports \\n). You can use {{episode_id}}, {{part_idx}}, {{template_url}}"
+            placeholder="Текст (поддерживает \\n). Можно использовать {{episode_id}}, {{part_idx}}, {{template_url}}"
             value={text}
             onChange={(e) => setParam(index, "text", e.target.value)}
           />
@@ -442,7 +442,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               }}
             >
               <SelectTrigger>
-                <SelectValue placeholder="Selector from library" />
+              <SelectValue placeholder="Селектор из библиотеки" />
               </SelectTrigger>
               <SelectContent>
                 {locators.map((l) => (
@@ -453,7 +453,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               </SelectContent>
             </Select>
           </div>
-          <Input placeholder="key (e.g. Enter)" value={key} onChange={(e) => setParam(index, "key", e.target.value)} />
+          <Input placeholder="клавиша (например Enter)" value={key} onChange={(e) => setParam(index, "key", e.target.value)} />
         </div>
       );
     }
@@ -473,9 +473,9 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               <SelectValue placeholder="handle_broll" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="auto">auto</SelectItem>
-              <SelectItem value="true">true</SelectItem>
-              <SelectItem value="false">false</SelectItem>
+              <SelectItem value="auto">авто</SelectItem>
+              <SelectItem value="true">да</SelectItem>
+              <SelectItem value="false">нет</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -487,7 +487,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
       return (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
           <Input
-            placeholder="max_scenes (optional)"
+            placeholder="max_scenes (опционально)"
             value={maxScenes}
             onChange={(e) => {
               const v = e.target.value.trim();
@@ -495,6 +495,81 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
               else setParam(index, "max_scenes", Number(v));
             }}
           />
+        </div>
+      );
+    }
+
+    if (t === "select_episode_parts") {
+      const episode = asString(params["episode_name"] || params["episode"] || "");
+      const titleSelector = asString(params["title_selector"]);
+      const checkboxSelector = asString(params["checkbox_selector"]);
+      const buttonSelector = asString(params["button_selector"]);
+
+      return (
+        <div className="space-y-2">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <Input
+              placeholder="Название эпизода (или {{episode_id}})"
+              value={episode}
+              onChange={(e) => setParam(index, "episode_name", e.target.value)}
+            />
+             <Select
+              value={locators.find((l) => l.selector === titleSelector || l.name === titleSelector)?.name || ""}
+              onValueChange={(v) => {
+                const loc = locators.find((l) => l.name === v);
+                if (loc) setParam(index, "title_selector", loc.selector);
+              }}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Селектор заголовка" />
+              </SelectTrigger>
+              <SelectContent>
+                {locators.map((l) => (
+                  <SelectItem key={l.name} value={l.name}>
+                    {l.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <Select
+              value={locators.find((l) => l.selector === checkboxSelector || l.name === checkboxSelector)?.name || ""}
+              onValueChange={(v) => {
+                const loc = locators.find((l) => l.name === v);
+                if (loc) setParam(index, "checkbox_selector", loc.selector);
+              }}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Селектор чекбокса" />
+              </SelectTrigger>
+              <SelectContent>
+                {locators.map((l) => (
+                  <SelectItem key={l.name} value={l.name}>
+                    {l.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={locators.find((l) => l.selector === buttonSelector || l.name === buttonSelector)?.name || ""}
+              onValueChange={(v) => {
+                const loc = locators.find((l) => l.name === v);
+                if (loc) setParam(index, "button_selector", loc.selector);
+              }}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Селектор кнопки Далее" />
+              </SelectTrigger>
+              <SelectContent>
+                {locators.map((l) => (
+                  <SelectItem key={l.name} value={l.name}>
+                    {l.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       );
     }
@@ -547,21 +622,21 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
       {/* Header */}
       <div className="p-4 border-b border-border">
         <div className="flex items-center justify-between">
-          <h3 className="text-lg font-semibold text-foreground">Workflow Builder</h3>
+          <h3 className="text-lg font-semibold text-foreground">Конструктор воркфлоу</h3>
           <div className="flex items-center gap-2">
           <Button size="sm" onClick={addStep}>
             <Plus className="w-4 h-4 mr-1" />
-            Add Step
+            Добавить шаг
           </Button>
           {onSave && (
             <Button size="sm" variant="secondary" onClick={onSave}>
-              Save
+              Сохранить
             </Button>
           )}
           </div>
         </div>
         <p className="text-sm text-muted-foreground mt-1">
-          Define the automation steps in order
+          Определите шаги автоматизации по порядку
         </p>
       </div>
 
@@ -600,7 +675,9 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
                 {/* Content */}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="font-medium text-foreground">{step.type}</span>
+                    <span className="font-medium text-foreground">
+                      {STEP_TYPE_OPTIONS.find((opt) => opt.value === step.type)?.label || step.type}
+                    </span>
                     <Badge variant="secondary" className="text-[10px]">
                       {step.id}
                     </Badge>
@@ -616,7 +693,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
                       }}
                     >
                       <SelectTrigger>
-                        <SelectValue placeholder="Step type" />
+                      <SelectValue placeholder="Тип шага" />
                       </SelectTrigger>
                       <SelectContent>
                         {STEP_TYPE_OPTIONS.map((opt) => (
@@ -666,9 +743,9 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
                     onClick={() => toggleStep(step.id)}
                   >
                     {step.enabled ? (
-                      <span className="text-[10px] font-medium">ON</span>
+                      <span className="text-[10px] font-medium">ВКЛ</span>
                     ) : (
-                      <span className="text-[10px] font-medium">OFF</span>
+                      <span className="text-[10px] font-medium">ВЫКЛ</span>
                     )}
                   </Button>
                   <Button
@@ -689,7 +766,7 @@ export function WorkflowBuilder({ steps, onStepsChange, onSave, locators }: Prop
       {/* Footer */}
       <div className="p-3 border-t border-border bg-muted/20">
         <p className="text-xs text-muted-foreground text-center">
-          {steps.filter((s) => s.enabled).length} of {steps.length} steps enabled
+          Включено шагов: {steps.filter((s) => s.enabled).length} из {steps.length}
         </p>
       </div>
     </div>

@@ -32,6 +32,9 @@ import {
   HelpCircle,
   Save,
   RotateCcw,
+  Video,
+  Plus,
+  Trash2,
 } from "lucide-react";
 import { WizardNavigation } from "@/components/common/WizardNavigation";
 import { toast } from "sonner";
@@ -44,7 +47,6 @@ interface SettingFieldProps {
 }
 
 type AppConfig = Record<string, unknown> & {
-  headless?: boolean;
   max_concurrency?: number;
   download_dir?: string;
   pre_fill_wait?: number;
@@ -61,6 +63,7 @@ type AppConfig = Record<string, unknown> & {
   orientation_choice?: string;
   close_media_panel_after_broll?: boolean;
   enable_notifications?: boolean;
+  enable_generation?: boolean;
   pre_generation_pause_sec?: number;
   confirm_timeout_sec?: number;
   abort_on_validation_failure?: boolean;
@@ -68,13 +71,15 @@ type AppConfig = Record<string, unknown> & {
   save_fallback_wait_sec?: number;
   max_scenes?: number;
   parallel_mode?: string;
-  browser?: string;
-  chrome_cdp_url?: string;
-  multilogin_cdp_url?: string;
-  profile_to_use?: string;
   profiles?: Record<string, unknown>;
   telegram_bot_token?: string;
   telegram_chat_id?: string;
+  checks?: Record<string, { enabled?: boolean; attempts?: number; interval_sec?: number }>;
+  telegram_broadcast_all?: boolean;
+  video_bitrate_kbps?: number;
+  video_resolution?: string;
+  video_codec?: string;
+  audio_codec?: string;
 };
 
 function SettingField({ label, tooltip, children }: SettingFieldProps) {
@@ -99,7 +104,6 @@ function SettingField({ label, tooltip, children }: SettingFieldProps) {
 export default function Settings() {
   const API = API_BASE_URL;
   const [config, setConfig] = useState<AppConfig>({});
-  const [headless, setHeadless] = useState<boolean>(false);
   const [parallelWorkers, setParallelWorkers] = useState<number[]>([2]);
   const [downloadDir, setDownloadDir] = useState<string>("./downloads");
   const [preFillWaitSec, setPreFillWaitSec] = useState<number>(1.5);
@@ -116,6 +120,7 @@ export default function Settings() {
   const [orientationChoice, setOrientationChoice] = useState<string>("Горизонтальная");
   const [closeMediaPanelAfterBroll, setCloseMediaPanelAfterBroll] = useState<boolean>(true);
   const [enableNotifications, setEnableNotifications] = useState<boolean>(false);
+  const [enableGeneration, setEnableGeneration] = useState<boolean>(true);
   const [preGenerationPauseSec, setPreGenerationPauseSec] = useState<number>(20);
   const [confirmTimeoutSec, setConfirmTimeoutSec] = useState<number>(10);
   const [abortOnValidationFailure, setAbortOnValidationFailure] = useState<boolean>(false);
@@ -123,20 +128,32 @@ export default function Settings() {
   const [saveFallbackWaitSec, setSaveFallbackWaitSec] = useState<number>(7);
   const [maxScenes, setMaxScenes] = useState<number>(15);
   const [parallelMode, setParallelMode] = useState<string>("tabs");
-  const [browserMode, setBrowserMode] = useState<string>("chrome");
-  const [chromeCdpUrl, setChromeCdpUrl] = useState<string>("http://localhost:9222");
-  const [multiloginCdpUrl, setMultiloginCdpUrl] = useState<string>("");
-  const [profileToUse, setProfileToUse] = useState<string>("ask");
   const [telegramBotToken, setTelegramBotToken] = useState<string>("");
   const [telegramChatId, setTelegramChatId] = useState<string>("");
+  const [telegramBroadcastAll, setTelegramBroadcastAll] = useState<boolean>(false);
   const [advancedJson, setAdvancedJson] = useState<string>("");
+  const [verifySceneCheckEnabled, setVerifySceneCheckEnabled] = useState<boolean>(true);
+  const [verifySceneCheckAttempts, setVerifySceneCheckAttempts] = useState<number>(3);
+  const [verifySceneCheckIntervalSec, setVerifySceneCheckIntervalSec] = useState<number>(0.2);
+  const [validationCheckEnabled, setValidationCheckEnabled] = useState<boolean>(true);
+  const [validationCheckAttempts, setValidationCheckAttempts] = useState<number>(3);
+  const [validationCheckIntervalSec, setValidationCheckIntervalSec] = useState<number>(1.5);
+  
+  // Video settings
+  const [videoBitrateKbps, setVideoBitrateKbps] = useState<number>(5000);
+  const [videoResolution, setVideoResolution] = useState<string>("1080p");
+  const [videoCodec, setVideoCodec] = useState<string>("h264");
+  const [audioCodec, setAudioCodec] = useState<string>("aac");
+  
+  // Browser profiles
+  const [profiles, setProfiles] = useState<Record<string, { cdp_url?: string; profile_path?: string; browser_type?: "chrome" | "chromium" }>>({});
+  const [editingProfileName, setEditingProfileName] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const load = async () => {
       try {
         const cfg: AppConfig = await fetch(`${API}/config`).then((r) => r.json());
         setConfig(cfg);
-        setHeadless(Boolean(cfg.headless));
         setParallelWorkers([Number(cfg.max_concurrency || 2)]);
         setDownloadDir(String(cfg.download_dir || "./downloads"));
         setPreFillWaitSec(Number(cfg.pre_fill_wait || 1.5));
@@ -153,6 +170,7 @@ export default function Settings() {
         setOrientationChoice(String(cfg.orientation_choice || "Горизонтальная"));
         setCloseMediaPanelAfterBroll(Boolean(cfg.close_media_panel_after_broll ?? true));
         setEnableNotifications(Boolean(cfg.enable_notifications));
+        setEnableGeneration(Boolean(cfg.enable_generation ?? true));
         setPreGenerationPauseSec(Number(cfg.pre_generation_pause_sec ?? 20));
         setConfirmTimeoutSec(Number(cfg.confirm_timeout_sec ?? 10));
         setAbortOnValidationFailure(Boolean(cfg.abort_on_validation_failure));
@@ -160,12 +178,24 @@ export default function Settings() {
         setSaveFallbackWaitSec(Number(cfg.save_fallback_wait_sec ?? 7));
         setMaxScenes(Number(cfg.max_scenes ?? 15));
         setParallelMode(String(cfg.parallel_mode || "tabs"));
-        setBrowserMode(String(cfg.browser || "chrome"));
-        setChromeCdpUrl(String(cfg.chrome_cdp_url || "http://localhost:9222"));
-        setMultiloginCdpUrl(String(cfg.multilogin_cdp_url || ""));
-        setProfileToUse(String(cfg.profile_to_use || "ask"));
         setTelegramBotToken(String(cfg.telegram_bot_token || ""));
         setTelegramChatId(String(cfg.telegram_chat_id || ""));
+        setTelegramBroadcastAll(Boolean(cfg.telegram_broadcast_all));
+        const checks = (cfg.checks || {}) as Record<string, { enabled?: boolean; attempts?: number; interval_sec?: number }>;
+        const verifyCfg = checks.verify_scene || {};
+        const validationCfg = checks.validation || {};
+        setVerifySceneCheckEnabled(Boolean(verifyCfg.enabled ?? true));
+        setVerifySceneCheckAttempts(Number(verifyCfg.attempts ?? 3));
+        setVerifySceneCheckIntervalSec(Number(verifyCfg.interval_sec ?? 0.2));
+        setValidationCheckEnabled(Boolean(validationCfg.enabled ?? true));
+        setValidationCheckAttempts(Number(validationCfg.attempts ?? 3));
+        setValidationCheckIntervalSec(Number(validationCfg.interval_sec ?? 1.5));
+        // Video settings
+        setVideoBitrateKbps(Number(cfg.video_bitrate_kbps ?? 5000));
+        setVideoResolution(String(cfg.video_resolution || "1080p"));
+        setVideoCodec(String(cfg.video_codec || "h264"));
+        setAudioCodec(String(cfg.audio_codec || "aac"));
+        setProfiles((cfg.profiles || {}) as Record<string, { cdp_url?: string; profile_path?: string }>);
         setAdvancedJson(JSON.stringify(cfg, null, 2));
       } catch (e) {
         void e;
@@ -176,7 +206,6 @@ export default function Settings() {
 
   const handleSave = async () => {
     const payload = {
-      headless,
       max_concurrency: parallelWorkers[0],
       download_dir: downloadDir,
       pre_fill_wait: preFillWaitSec,
@@ -193,6 +222,7 @@ export default function Settings() {
       orientation_choice: orientationChoice,
       close_media_panel_after_broll: closeMediaPanelAfterBroll,
       enable_notifications: enableNotifications,
+      enable_generation: enableGeneration,
       pre_generation_pause_sec: preGenerationPauseSec,
       confirm_timeout_sec: confirmTimeoutSec,
       abort_on_validation_failure: abortOnValidationFailure,
@@ -200,12 +230,26 @@ export default function Settings() {
       save_fallback_wait_sec: saveFallbackWaitSec,
       max_scenes: maxScenes,
       parallel_mode: parallelMode,
-      browser: browserMode,
-      chrome_cdp_url: chromeCdpUrl,
-      multilogin_cdp_url: multiloginCdpUrl,
-      profile_to_use: profileToUse,
       telegram_bot_token: telegramBotToken,
       telegram_chat_id: telegramChatId,
+      telegram_broadcast_all: telegramBroadcastAll,
+      checks: {
+        verify_scene: {
+          enabled: verifySceneCheckEnabled,
+          attempts: verifySceneCheckAttempts,
+          interval_sec: verifySceneCheckIntervalSec,
+        },
+        validation: {
+          enabled: validationCheckEnabled,
+          attempts: validationCheckAttempts,
+          interval_sec: validationCheckIntervalSec,
+        },
+      },
+      video_bitrate_kbps: videoBitrateKbps,
+      video_resolution: videoResolution,
+      video_codec: videoCodec,
+      audio_codec: audioCodec,
+      profiles: profiles,
     };
     await fetch(`${API}/config`, {
       method: "PUT",
@@ -216,7 +260,7 @@ export default function Settings() {
   };
 
   const handleReset = () => {
-    toast.info("Settings reset to defaults");
+    toast.info("Настройки сброшены по умолчанию");
   };
 
   const handleSaveAdvanced = async () => {
@@ -263,80 +307,7 @@ export default function Settings() {
 
       {/* Settings Accordion */}
       <div className="rounded-xl border border-border shadow-card">
-        <Accordion type="multiple" defaultValue={["browser", "timeouts", "parallel", "media"]} className="w-full">
-          {/* Browser Settings */}
-          <AccordionItem value="browser" className="border-b border-border">
-            <AccordionTrigger className="px-6 hover:no-underline hover:bg-muted/30">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-lg bg-primary/10 text-primary">
-                  <Globe className="w-4 h-4" />
-                </div>
-                <div className="text-left">
-                  <div className="font-semibold">Настройки браузера</div>
-                  <div className="text-sm text-muted-foreground font-normal">
-                    Управление режимами и внешним видом
-                  </div>
-                </div>
-              </div>
-            </AccordionTrigger>
-            <AccordionContent className="px-6 pb-4">
-              <SettingField
-                label="Режим Headless"
-                tooltip="Без UI. Быстрее, но сложнее отладка."
-              >
-                <Switch checked={headless} onCheckedChange={(v) => setHeadless(Boolean(v))} />
-              </SettingField>
-
-              <SettingField
-                label="Режим браузера"
-                tooltip="Источник браузера: Chrome CDP или Multilogin."
-              >
-                <Select value={browserMode} onValueChange={setBrowserMode}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="chrome">chrome</SelectItem>
-                    <SelectItem value="multilogin">multilogin</SelectItem>
-                  </SelectContent>
-                </Select>
-              </SettingField>
-
-              <SettingField
-                label="Chrome CDP URL"
-                tooltip="Адрес CDP для подключения к Chrome."
-              >
-                <Input value={chromeCdpUrl} onChange={(e) => setChromeCdpUrl(e.target.value)} />
-              </SettingField>
-
-              <SettingField
-                label="Multilogin CDP URL"
-                tooltip="Адрес CDP для Multilogin (если используешь multilogin)."
-              >
-                <Input value={multiloginCdpUrl} onChange={(e) => setMultiloginCdpUrl(e.target.value)} />
-              </SettingField>
-
-              <SettingField
-                label="Profile To Use"
-                tooltip="Какой профиль использовать: ask или имя профиля из profiles."
-              >
-                <Select value={profileToUse} onValueChange={setProfileToUse}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="ask">ask</SelectItem>
-                    {Object.keys((config.profiles || {}) as Record<string, unknown>).map((k) => (
-                      <SelectItem key={k} value={k}>
-                        {k}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </SettingField>
-            </AccordionContent>
-          </AccordionItem>
-
+        <Accordion type="multiple" defaultValue={[]} className="w-full">
           {/* Timeouts & Delays */}
           <AccordionItem value="timeouts" className="border-b border-border">
             <AccordionTrigger className="px-6 hover:no-underline hover:bg-muted/30">
@@ -354,87 +325,159 @@ export default function Settings() {
             </AccordionTrigger>
             <AccordionContent className="px-6 pb-4">
               <SettingField
-                label="Reload Timeout (sec)"
+                label="Таймаут перезагрузки (сек)"
                 tooltip="Максимальное ожидание перезагрузки страницы."
               >
                 <Input type="number" value={reloadTimeoutSec} onChange={(e) => setReloadTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Playwright Timeout (sec)"
+                label="Таймаут Playwright (сек)"
                 tooltip="Таймаут по умолчанию для операций Playwright."
               >
                 <Input type="number" value={playwrightTimeoutSec} onChange={(e) => setPlaywrightTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Delay Between Scenes (sec)"
+                label="Пауза между сценами (сек)"
                 tooltip="Задержка между заполнением сцен."
               >
                 <Input type="number" value={delayBetweenScenesSec} onChange={(e) => setDelayBetweenScenesSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Pre-fill Wait (sec)"
+                label="Ожидание перед заполнением (сек)"
                 tooltip="Дополнительное ожидание перед началом заполнения после перезагрузки."
               >
                 <Input type="number" value={preFillWaitSec} onChange={(e) => setPreFillWaitSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Post Reload Wait (sec)"
+                label="Ожидание после перезагрузки (сек)"
                 tooltip="Запасное ожидание после перезагрузки, если селекторы не готовы."
               >
                 <Input type="number" value={postReloadWaitSec} onChange={(e) => setPostReloadWaitSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Search Results Timeout (sec)"
+                label="Ожидание результатов поиска (сек)"
                 tooltip="Ожидание появления результатов поиска медиа."
               >
                 <Input type="number" value={searchResultsTimeoutSec} onChange={(e) => setSearchResultsTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Validation Ready Timeout (sec)"
+                label="Ожидание перед валидацией (сек)"
                 tooltip="Ожидание готовности DOM перед валидацией."
               >
                 <Input type="number" value={validationReadyTimeoutSec} onChange={(e) => setValidationReadyTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Save Notification Timeout (sec)"
+                label="Ожидание уведомления «Сохранено» (сек)"
                 tooltip="Ожидание появления уведомления «Сохранено»."
               >
                 <Input type="number" value={saveNotificationTimeoutSec} onChange={(e) => setSaveNotificationTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Generation Redirect Timeout (sec)"
+                label="Таймаут редиректа (сек)"
                 tooltip="Ожидание редиректа на /projects после отправки."
               >
                 <Input type="number" value={generationRedirectTimeoutSec} onChange={(e) => setGenerationRedirectTimeoutSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Save Fallback Wait (sec)"
+                label="Пауза при отсутствии уведомления (сек)"
                 tooltip="Пауза, если уведомление «Сохранено» не появилось."
               >
                 <Input type="number" value={saveFallbackWaitSec} onChange={(e) => setSaveFallbackWaitSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Pre-generation Pause (sec)"
+                label="Включить генерацию"
+                tooltip="Отправка проекта на генерацию после заполнения сцен."
+              >
+                <Switch checked={enableGeneration} onCheckedChange={(v) => setEnableGeneration(Boolean(v))} />
+              </SettingField>
+
+              <SettingField
+                label="Пауза перед генерацией (сек)"
                 tooltip="Пауза перед отправкой на генерацию (заменяет confirm_timeout_sec)."
               >
                 <Input type="number" value={preGenerationPauseSec} onChange={(e) => setPreGenerationPauseSec(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Confirm Timeout (sec)"
+                label="Таймаут подтверждения (сек)"
                 tooltip="Таймаут подтверждения, если pre_generation_pause_sec не используется."
               >
                 <Input type="number" value={confirmTimeoutSec} onChange={(e) => setConfirmTimeoutSec(Number(e.target.value))} />
+              </SettingField>
+            </AccordionContent>
+          </AccordionItem>
+
+          <AccordionItem value="checks" className="border-b border-border">
+            <AccordionTrigger className="px-6 hover:no-underline hover:bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-muted/30 text-muted-foreground">
+                  <RotateCcw className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="font-semibold">Проверки</div>
+                  <div className="text-sm text-muted-foreground font-normal">
+                    Включение и повторы валидаций
+                  </div>
+                </div>
+              </div>
+            </AccordionTrigger>
+            <AccordionContent className="px-6 pb-4">
+              <SettingField
+                label="Проверка текста сцены"
+                tooltip="Проверка текста после вставки сцены."
+              >
+                <div className="flex items-center gap-2">
+                  <Switch checked={verifySceneCheckEnabled} onCheckedChange={(v) => setVerifySceneCheckEnabled(Boolean(v))} />
+                  <Input
+                    type="number"
+                    value={verifySceneCheckAttempts}
+                    onChange={(e) => setVerifySceneCheckAttempts(Number(e.target.value))}
+                    className="w-[90px]"
+                    min={1}
+                  />
+                  <Input
+                    type="number"
+                    value={verifySceneCheckIntervalSec}
+                    onChange={(e) => setVerifySceneCheckIntervalSec(Number(e.target.value))}
+                    className="w-[90px]"
+                    min={0}
+                    step={0.1}
+                  />
+                </div>
+              </SettingField>
+
+              <SettingField
+                label="Итоговая проверка"
+                tooltip="Повторная проверка заполненности сцен."
+              >
+                <div className="flex items-center gap-2">
+                  <Switch checked={validationCheckEnabled} onCheckedChange={(v) => setValidationCheckEnabled(Boolean(v))} />
+                  <Input
+                    type="number"
+                    value={validationCheckAttempts}
+                    onChange={(e) => setValidationCheckAttempts(Number(e.target.value))}
+                    className="w-[90px]"
+                    min={1}
+                  />
+                  <Input
+                    type="number"
+                    value={validationCheckIntervalSec}
+                    onChange={(e) => setValidationCheckIntervalSec(Number(e.target.value))}
+                    className="w-[90px]"
+                    min={0}
+                    step={0.1}
+                  />
+                </div>
               </SettingField>
             </AccordionContent>
           </AccordionItem>
@@ -447,17 +490,17 @@ export default function Settings() {
                   <Cpu className="w-4 h-4" />
                 </div>
                 <div className="text-left">
-                  <div className="font-semibold">Parallel Execution</div>
+                  <div className="font-semibold">Параллельное выполнение</div>
                   <div className="text-sm text-muted-foreground font-normal">
-                    Configure multi-threaded processing
+                    Настройка параллельной обработки
                   </div>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="px-6 pb-4">
               <SettingField
-                label="Worker Count"
-                tooltip="Number of parallel browser instances to run."
+                label="Количество воркеров"
+                tooltip="Количество параллельных экземпляров браузера."
               >
                 <div className="space-y-3">
                   <Slider
@@ -468,13 +511,13 @@ export default function Settings() {
                     step={1}
                   />
                   <div className="text-center text-sm font-mono text-muted-foreground">
-                    {parallelWorkers[0]} worker{parallelWorkers[0] > 1 ? "s" : ""}
+                    {parallelWorkers[0]} воркеров
                   </div>
                 </div>
               </SettingField>
 
               <SettingField
-                label="Parallel Mode"
+                label="Режим параллели"
                 tooltip="Как запускать параллельно: tabs или profiles."
               >
                 <Select value={parallelMode} onValueChange={setParallelMode}>
@@ -482,8 +525,8 @@ export default function Settings() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="tabs">tabs</SelectItem>
-                    <SelectItem value="profiles">profiles</SelectItem>
+                    <SelectItem value="tabs">Вкладки</SelectItem>
+                    <SelectItem value="profiles">Профили</SelectItem>
                   </SelectContent>
                 </Select>
               </SettingField>
@@ -499,38 +542,38 @@ export default function Settings() {
                 <div className="text-left">
                   <div className="font-semibold">Медиа и голос</div>
                   <div className="text-sm text-muted-foreground font-normal">
-                    B-roll и Enhance Voice
+                    B-roll и усиление голоса
                   </div>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="px-6 pb-4">
               <SettingField
-                label="Enhance Voice"
-                tooltip="Нажимать Enhance Voice после заполнения сцены."
+                label="Усиление голоса"
+                tooltip="Нажимать «Усилить голос» после заполнения сцены."
               >
                 <Switch checked={enhanceVoice} onCheckedChange={(v) => setEnhanceVoice(Boolean(v))} />
               </SettingField>
 
               <SettingField
-                label="Media Source"
-                tooltip="Источник поиска b-roll."
+                label="Источник медиа"
+                tooltip="Источник поиска B-roll."
               >
                 <Select value={mediaSource} onValueChange={setMediaSource}>
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">all</SelectItem>
-                    <SelectItem value="getty">getty</SelectItem>
-                    <SelectItem value="storyblocks">storyblocks</SelectItem>
-                    <SelectItem value="pexels">pexels</SelectItem>
+                    <SelectItem value="all">Все</SelectItem>
+                    <SelectItem value="getty">Getty</SelectItem>
+                    <SelectItem value="storyblocks">Storyblocks</SelectItem>
+                    <SelectItem value="pexels">Pexels</SelectItem>
                   </SelectContent>
                 </Select>
               </SettingField>
 
               <SettingField
-                label="Orientation"
+                label="Ориентация"
                 tooltip="Ориентация медиа в поиске."
               >
                 <Select value={orientationChoice} onValueChange={setOrientationChoice}>
@@ -545,10 +588,92 @@ export default function Settings() {
               </SettingField>
 
               <SettingField
-                label="Close Media Panel"
-                tooltip="Закрывать панель Медиа после добавления b-roll."
+                label="Закрывать панель Медиа"
+                tooltip="Закрывать панель Медиа после добавления B-roll."
               >
                 <Switch checked={closeMediaPanelAfterBroll} onCheckedChange={(v) => setCloseMediaPanelAfterBroll(Boolean(v))} />
+              </SettingField>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Video Settings */}
+          <AccordionItem value="video" className="border-b border-border">
+            <AccordionTrigger className="px-6 hover:no-underline hover:bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-blue-400/10 text-blue-400">
+                  <Video className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="font-semibold">Параметры видео</div>
+                  <div className="text-sm text-muted-foreground font-normal">
+                    Качество и кодеки для выходного видео
+                  </div>
+                </div>
+              </div>
+            </AccordionTrigger>
+            <AccordionContent className="px-6 pb-4">
+              <SettingField
+                label="Битрейт (kbps)"
+                tooltip="Выше битрейт = лучше качество, но больше размер файла."
+              >
+                <Select value={String(videoBitrateKbps)} onValueChange={(v) => setVideoBitrateKbps(Number(v))}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="2000">2000 kbps (Низкое качество)</SelectItem>
+                    <SelectItem value="5000">5000 kbps (Среднее качество)</SelectItem>
+                    <SelectItem value="8000">8000 kbps (Высокое качество)</SelectItem>
+                    <SelectItem value="15000">15000 kbps (Максимальное качество)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </SettingField>
+
+              <SettingField
+                label="Разрешение"
+                tooltip="Выбор разрешения выходного видео. 'Оригинальное' сохранит исходное разрешение."
+              >
+                <Select value={videoResolution} onValueChange={setVideoResolution}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="720p">720p (HD)</SelectItem>
+                    <SelectItem value="1080p">1080p (Full HD)</SelectItem>
+                    <SelectItem value="4k">4K</SelectItem>
+                    <SelectItem value="original">Оригинальное</SelectItem>
+                  </SelectContent>
+                </Select>
+              </SettingField>
+
+              <SettingField
+                label="Видео кодек"
+                tooltip="H.264 имеет лучшую совместимость, H.265 обеспечивает лучшее сжатие."
+              >
+                <Select value={videoCodec} onValueChange={setVideoCodec}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="h264">H.264 (совместимость)</SelectItem>
+                    <SelectItem value="h265">H.265 (сжатие)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </SettingField>
+
+              <SettingField
+                label="Аудио кодек"
+                tooltip="AAC обеспечивает лучшее качество на том же битрейте."
+              >
+                <Select value={audioCodec} onValueChange={setAudioCodec}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="aac">AAC (рекомендуется)</SelectItem>
+                    <SelectItem value="mp3">MP3</SelectItem>
+                  </SelectContent>
+                </Select>
               </SettingField>
             </AccordionContent>
           </AccordionItem>
@@ -561,30 +686,37 @@ export default function Settings() {
                   <Key className="w-4 h-4" />
                 </div>
                 <div className="text-left">
-                  <div className="font-semibold">API Keys</div>
+                  <div className="font-semibold">Ключи API</div>
                   <div className="text-sm text-muted-foreground font-normal">
-                    External service credentials
+                    Учетные данные внешних сервисов
                   </div>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="px-6 pb-4">
               <SettingField
-                label="Telegram Bot Token"
+                label="Токен Telegram-бота"
                 tooltip="Токен бота для уведомлений."
               >
                 <Input type="password" value={telegramBotToken} onChange={(e) => setTelegramBotToken(e.target.value)} />
               </SettingField>
 
               <SettingField
-                label="Telegram Chat ID"
-                tooltip="Чат ID для уведомлений."
+                label="Chat ID Telegram"
+                tooltip="Если включена рассылка — можно оставить пустым."
               >
                 <Input value={telegramChatId} onChange={(e) => setTelegramChatId(e.target.value)} />
               </SettingField>
 
               <SettingField
-                label="Enable Notifications"
+                label="Рассылка во все чаты бота"
+                tooltip="Отправлять уведомления во все чаты, где был активен бот."
+              >
+                <Switch checked={telegramBroadcastAll} onCheckedChange={(v) => setTelegramBroadcastAll(Boolean(v))} />
+              </SettingField>
+
+              <SettingField
+                label="Включить уведомления"
                 tooltip="Включить локальные уведомления macOS."
               >
                 <Switch checked={enableNotifications} onCheckedChange={(v) => setEnableNotifications(Boolean(v))} />
@@ -600,41 +732,187 @@ export default function Settings() {
                   <FolderOpen className="w-4 h-4" />
                 </div>
                 <div className="text-left">
-                  <div className="font-semibold">File Paths</div>
+                  <div className="font-semibold">Пути к файлам</div>
                   <div className="text-sm text-muted-foreground font-normal">
-                    Configure input/output directories
+                    Настройка директорий ввода/вывода
                   </div>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="px-6 pb-4">
               <SettingField
-                label="Output Directory"
-                tooltip="Where to save generated videos."
+                label="Папка вывода"
+                tooltip="Куда сохранять файлы и результаты."
               >
                 <Input value={downloadDir} onChange={(e) => setDownloadDir(e.target.value)} />
               </SettingField>
 
               <SettingField
-                label="Max Scenes"
+                label="Максимум сцен"
                 tooltip="Максимальное число сцен в шаблоне."
               >
                 <Input type="number" value={maxScenes} onChange={(e) => setMaxScenes(Number(e.target.value))} />
               </SettingField>
 
               <SettingField
-                label="Abort On Validation Failure"
+                label="Останов при ошибке валидации"
                 tooltip="Останавливать процесс, если валидация не прошла."
               >
                 <Switch checked={abortOnValidationFailure} onCheckedChange={(v) => setAbortOnValidationFailure(Boolean(v))} />
               </SettingField>
 
               <SettingField
-                label="Interactive On Mismatch"
+                label="Ручное подтверждение при несоответствиях"
                 tooltip="Просить вмешательство пользователя при несоответствиях."
               >
                 <Switch checked={interactiveOnMismatch} onCheckedChange={(v) => setInteractiveOnMismatch(Boolean(v))} />
               </SettingField>
+            </AccordionContent>
+          </AccordionItem>
+
+          {/* Browser Profiles */}
+          <AccordionItem value="profiles" className="border-b border-border">
+            <AccordionTrigger className="px-6 hover:no-underline hover:bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-primary/10 text-primary">
+                  <Globe className="w-4 h-4" />
+                </div>
+                <div className="text-left">
+                  <div className="font-semibold">Профили браузера</div>
+                  <div className="text-sm text-muted-foreground font-normal">
+                    Управление профилями Chrome и Chromium
+                  </div>
+                </div>
+              </div>
+            </AccordionTrigger>
+            <AccordionContent className="px-6 pb-4">
+              <div className="space-y-4">
+                {Object.entries(profiles).map(([name, profile]) => {
+                  const browserType = profile.browser_type || (profile.cdp_url ? "chrome" : "chromium");
+                  const displayName = editingProfileName[name] !== undefined ? editingProfileName[name] : name;
+                  
+                  return (
+                    <div key={name} className="rounded-lg border border-border p-4 space-y-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex-1">
+                          <Label className="text-xs text-muted-foreground mb-1 block">Название профиля</Label>
+                          <Input
+                            value={displayName}
+                            onChange={(e) => {
+                              setEditingProfileName({ ...editingProfileName, [name]: e.target.value });
+                            }}
+                            onBlur={() => {
+                              if (editingProfileName[name] && editingProfileName[name] !== name) {
+                                const newProfiles: typeof profiles = {};
+                                Object.entries(profiles).forEach(([k, v]) => {
+                                  if (k === name) {
+                                    newProfiles[editingProfileName[name]] = v;
+                                  } else {
+                                    newProfiles[k] = v;
+                                  }
+                                });
+                                setProfiles(newProfiles);
+                                const newEditing = { ...editingProfileName };
+                                delete newEditing[name];
+                                setEditingProfileName(newEditing);
+                              }
+                            }}
+                            placeholder="Имя профиля"
+                            className="font-semibold"
+                          />
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-destructive hover:text-destructive mt-6"
+                          onClick={() => {
+                            const newProfiles = { ...profiles };
+                            delete newProfiles[name];
+                            setProfiles(newProfiles);
+                            const newEditing = { ...editingProfileName };
+                            delete newEditing[name];
+                            setEditingProfileName(newEditing);
+                          }}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </Button>
+                      </div>
+                      <div className="space-y-2">
+                        <div>
+                          <Label className="text-xs text-muted-foreground">Тип браузера</Label>
+                          <Select
+                            value={browserType}
+                            onValueChange={(v) => {
+                              const newProfile = { ...profile, browser_type: v as "chrome" | "chromium" };
+                              if (v === "chromium") {
+                                delete newProfile.cdp_url;
+                              } else if (!newProfile.cdp_url) {
+                                newProfile.cdp_url = "http://localhost:9222";
+                              }
+                              setProfiles({
+                                ...profiles,
+                                [name]: newProfile,
+                              });
+                            }}
+                          >
+                            <SelectTrigger className="mt-1">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="chrome">Chrome (CDP)</SelectItem>
+                              <SelectItem value="chromium">Chromium (встроенный)</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {browserType === "chrome" && (
+                          <div>
+                            <Label className="text-xs text-muted-foreground">CDP URL</Label>
+                            <Input
+                              value={profile.cdp_url || ""}
+                              onChange={(e) => {
+                                setProfiles({
+                                  ...profiles,
+                                  [name]: { ...profile, cdp_url: e.target.value },
+                                });
+                              }}
+                              placeholder="http://localhost:9222"
+                              className="mt-1"
+                            />
+                          </div>
+                        )}
+                        <div>
+                          <Label className="text-xs text-muted-foreground">Путь к профилю (опционально)</Label>
+                          <Input
+                            value={profile.profile_path || ""}
+                            onChange={(e) => {
+                              setProfiles({
+                                ...profiles,
+                                [name]: { ...profile, profile_path: e.target.value },
+                              });
+                            }}
+                            placeholder="~/chrome_automation"
+                            className="mt-1"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => {
+                    const newName = `profile_${Object.keys(profiles).length + 1}`;
+                    setProfiles({
+                      ...profiles,
+                      [newName]: { browser_type: "chrome", cdp_url: "", profile_path: "" },
+                    });
+                  }}
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Добавить профиль
+                </Button>
+              </div>
             </AccordionContent>
           </AccordionItem>
 
@@ -669,9 +947,9 @@ export default function Settings() {
       {/* Wizard Navigation */}
       <WizardNavigation
         backPath="/workflow"
-        backLabel="Workflow Builder"
+        backLabel="Конструктор воркфлоу"
         nextPath="/runner"
-        nextLabel="Start Automation"
+        nextLabel="Запуск автоматизации"
       />
     </div>
   );

@@ -1,23 +1,26 @@
 {
-  "csv_file": "/Users/ilya/Projects/heygen_automation/state/run_projects_1769023438.csv",
+  "csv_file": "/Users/ilya/Projects/heygen_automation_V2/state/run_projects_1769436340.csv",
   "max_scenes": 70,
   "browser": "chrome",
   "enable_enhance_voice": false,
-  "playwright_timeout_ms": 3000,
+  "playwright_timeout_ms": 8000,
+  "force_embedded_browser": false,
+  "debug_keep_browser_open_on_error": true,
   "pre_fill_wait": 1.5,
-  "delay_between_scenes": 1.5,
+  "delay_between_scenes": 1,
   "confirm_timeout_sec": 10,
   "pre_generation_pause_sec": 20,
   "post_reload_wait": 20,
   "reload_timeout_ms": 90000,
   "search_results_timeout_ms": 5000,
-  "validation_ready_timeout_ms": 6000,
+  "validation_ready_timeout_ms": 10000,
   "save_notification_timeout_ms": 4000,
   "save_fallback_wait_sec": 7,
   "generation_redirect_timeout_ms": 180000,
   "orientation_choice": "Горизонтальная",
   "media_source": "getty",
   "enable_notifications": true,
+  "enable_generation": false,
   "csv_columns": {
     "episode_id": "episode_id",
     "part_idx": "part_idx",
@@ -48,6 +51,7 @@
     "orientation_choice": "Выбор ориентации: Горизонтальная|Вертикальная",
     "media_source": "Источник для поиска B-roll: all|getty|storyblocks|pexels",
     "enable_notifications": "Включить macOS уведомления",
+    "enable_generation": "Включить отправку на генерацию",
     "csv_columns": "Переименование колонок CSV для совместимости",
     "episodes_to_process": "Список эпизодов для обработки (если пустой — из CSV)",
     "close_media_panel_after_broll": "Закрывать панель Медиа после вставки B-roll",
@@ -57,31 +61,55 @@
     "profile_to_use": "Какой профиль использовать (имя или 'ask')"
   },
   "episodes_to_process": [
-    "ep_prostate_5ways",
-    "dementia_vegetables"
+    "ep_japanese_foods"
   ],
   "close_media_panel_after_broll": true,
-  "interactive_on_mismatch": true,
+  "interactive_on_mismatch": false,
   "abort_on_validation_failure": false,
   "profiles": {
     "chrome_automation": {
       "cdp_url": "http://localhost:9222",
-      "profile_path": "~/chrome_automation"
+      "profile_path": "./chrome_data/automation_profile"
     },
     "chrome_heygen_2": {
       "cdp_url": "http://localhost:9223",
       "profile_path": "~/chrome_heygen_2"
+    },
+    "profile_3": {
+      "profile_path": "-/chrome_3",
+      "browser_type": "chromium"
     }
   },
-  "profile_to_use": "ask",
+  "profile_to_use": "profile_3",
+  "nano_banano_model": "gemini-3-pro-image-preview",
   "headless": false,
-  "telegram_bot_token": "",
+  "telegram_bot_token": "8494779397:AAGsD7yb1yUFS45JqkV-xgMxxTnivBakXzo",
   "telegram_chat_id": "",
+  "telegram_broadcast_all": true,
+  "telegram_chat_ids": [
+    "5679887533"
+  ],
   "download_dir": "./downloads",
   "max_concurrency": 1,
   "parallel_mode": "tabs",
-  "chrome_cdp_url": "http://localhost:9222",
+  "chrome_cdp_url": "http://localhost:9223",
   "multilogin_cdp_url": "",
+  "checks": {
+    "verify_scene": {
+      "enabled": true,
+      "attempts": 3,
+      "interval_sec": 0.2
+    },
+    "validation": {
+      "enabled": true,
+      "attempts": 3,
+      "interval_sec": 1.5
+    }
+  },
+  "video_bitrate_kbps": 5000,
+  "video_resolution": "1080p",
+  "video_codec": "h264",
+  "audio_codec": "aac",
   "workflow_file": "generate_episode.json",
   "workflow_steps": [
     {

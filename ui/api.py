@@ -2,6 +2,9 @@ import asyncio
 import os
 import json
 import time
+import subprocess
+import sys
+from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi import Query
@@ -12,6 +15,8 @@ from ui.workflows import list_workflows, load_workflow, save_workflow, validate_
 from ui.state import get_recent_episodes, get_projects, add_projects, save_projects, add_projects_with_data, add_projects_with_records
 from ui.locator_library import list_locators, save_locator, delete_locator
 from heygen_automation import HeyGenAutomation
+from ui.logger import logger
+from ui.notify import send_telegram, send_telegram_many, fetch_telegram_chat_ids
 import pandas as pd
 import io
 
@@ -35,12 +40,53 @@ _task_pause: Dict[str, asyncio.Event] = {}
 _global_pause = asyncio.Event()
 _global_pause.set()
 _sem = asyncio.Semaphore(int(getattr(runner, "max_concurrency", 2) or 2))
+_automation_refs: Dict[str, HeyGenAutomation] = {}
+_task_status: Dict[str, Dict[str, Any]] = {}
 
 def _now_ts() -> int:
     try:
         return int(time.time())
     except Exception:
         return 0
+
+def _browser_launch_command(cfg: Dict[str, Any]) -> List[str]:
+    chrome_path = str(cfg.get("chrome_binary") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    profile_path = str(cfg.get("chrome_profile_path") or "")
+    cdp_url = str(cfg.get("chrome_cdp_url") or "")
+    profiles = cfg.get("profiles") or {}
+    profile_to_use = str(cfg.get("profile_to_use") or "").strip()
+    if not profile_to_use or profile_to_use.lower() == "ask":
+        if "chrome_automation" in profiles:
+            profile_to_use = "chrome_automation"
+        elif profiles:
+            profile_to_use = list(profiles.keys())[0]
+    prof = profiles.get(profile_to_use) if profile_to_use else None
+    if isinstance(prof, dict):
+        if prof.get("profile_path"):
+            profile_path = str(prof.get("profile_path"))
+        if prof.get("cdp_url"):
+            cdp_url = str(prof.get("cdp_url"))
+    if not profile_path:
+        profile_path = "~/chrome_automation"
+    port = 9222
+    if cdp_url:
+        try:
+            parsed = urlparse(cdp_url)
+            if parsed.port:
+                port = int(parsed.port)
+        except Exception:
+            pass
+    profile_path = os.path.expanduser(profile_path)
+    return [
+        chrome_path,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_path}",
+        "https://app.heygen.com/projects",
+    ]
+
+def _is_browser_closed_error(msg: str) -> bool:
+    text = str(msg or "")
+    return "Target page, context or browser has been closed" in text or "has been closed" in text
 
 def _task_key(episode: str, part: int) -> str:
     return f"{episode}::{int(part)}"
@@ -72,6 +118,154 @@ def _set_task_status(t: Dict[str, Any], status: str) -> None:
     t["status"] = str(status or "")
     if status in ("success", "failed", "stopped") and not t.get("finished_at"):
         t["finished_at"] = _now_ts()
+
+def _compact_report_entries(items: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in items or []:
+        if isinstance(it, dict):
+            cur = {}
+            for k in ("scene_idx", "query", "error", "reason"):
+                if it.get(k) is not None:
+                    cur[k] = it.get(k)
+            if cur:
+                out.append(cur)
+        else:
+            out.append({"value": it})
+    return out
+
+def _telegram_config() -> tuple[str, str, bool]:
+    token = str(runner.config.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = str(runner.config.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    broadcast_all = bool(runner.config.get("telegram_broadcast_all", False))
+    return token, chat_id, broadcast_all
+
+def _telegram_chats_path() -> str:
+    return os.path.join("state", "telegram_chats.json")
+
+def _load_telegram_chats() -> List[str]:
+    path = _telegram_chats_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+    except Exception:
+        return []
+    return []
+
+def _save_telegram_chats(chat_ids: List[str]) -> None:
+    try:
+        os.makedirs("state", exist_ok=True)
+        with open(_telegram_chats_path(), "w", encoding="utf-8") as f:
+            json.dump(sorted({str(c) for c in chat_ids if str(c).strip()}), f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _get_broadcast_chat_ids(token: str, fallback_chat_id: str) -> List[str]:
+    cfg_list = runner.config.get("telegram_chat_ids")
+    if isinstance(cfg_list, list):
+        ids = [str(x) for x in cfg_list if str(x).strip()]
+    else:
+        ids = []
+    cached = _load_telegram_chats()
+    ids.extend(cached)
+    if fallback_chat_id:
+        ids.append(fallback_chat_id)
+    ids = sorted({c for c in ids if c})
+    if ids:
+        return ids
+    fetched = fetch_telegram_chat_ids(token)
+    if fetched:
+        _save_telegram_chats(fetched)
+    return fetched
+
+def _format_task_report_line(report: Dict[str, Any]) -> str:
+    if not isinstance(report, dict):
+        return ""
+    labels = {
+        "validation_missing": "несоответствия",
+        "broll_skipped": "b-roll пропущен",
+        "broll_no_results": "b-roll без результатов",
+        "broll_errors": "ошибки b-roll",
+        "manual_intervention": "вмешательство",
+    }
+    parts = []
+    for k, label in labels.items():
+        try:
+            v = int(report.get(k) or 0)
+        except Exception:
+            v = 0
+        if v > 0:
+            parts.append(f"{label}: {v}")
+    return ", ".join(parts)
+
+def _format_scene_errors(details: Optional[Dict[str, List[Dict[str, Any]]]]) -> str:
+    if not isinstance(details, dict):
+        return ""
+    scenes = set()
+    for key in ("validation_missing", "broll_errors", "broll_no_results", "broll_skipped"):
+        items = details.get(key) or []
+        for it in items:
+            if isinstance(it, dict) and it.get("scene_idx") is not None:
+                scenes.add(str(it.get("scene_idx")))
+    if not scenes:
+        return ""
+    ordered = sorted(scenes, key=lambda x: int(x) if str(x).isdigit() else x)
+    return ", ".join(ordered)
+
+def _send_task_telegram(t: Dict[str, Any], report: Optional[Dict[str, Any]] = None) -> None:
+    token, chat_id, broadcast_all = _telegram_config()
+    if not token or (not chat_id and not broadcast_all):
+        return
+    try:
+        status = str(t.get("status") or "")
+        episode = str(t.get("episode") or "")
+        part = str(t.get("part") or "")
+        scenes = f"{int(t.get('scene_done') or 0)}/{int(t.get('scene_total') or 0)}"
+        project_url = str(t.get("template_url") or "").strip()
+        project_status = str(t.get("project_status") or "").strip()
+        speakers = t.get("speakers") if isinstance(t.get("speakers"), list) else []
+        speakers_text = ", ".join([str(s) for s in speakers if str(s).strip()])
+        lines = [f"HeyGen: {episode} part {part}", f"Статус: {status}", f"Сцены: {scenes}"]
+        if project_status:
+            lines.append(f"Проект: {project_status}")
+        if project_url:
+            lines.append(f"Ссылка: {project_url}")
+        if speakers_text:
+            lines.append(f"Спикеры: {speakers_text}")
+        err = str(t.get("error") or "").strip()
+        if err:
+            lines.append(f"Ошибка: {err}")
+        scene_errs = _format_scene_errors(t.get("report_details") if isinstance(t.get("report_details"), dict) else None)
+        if scene_errs:
+            lines.append(f"Ошибки в сценах: {scene_errs}")
+        rep_line = _format_task_report_line(report or {})
+        if rep_line:
+            lines.append(f"Отчёт: {rep_line}")
+        text = "\n".join([l for l in lines if l])
+        ok = False
+        if broadcast_all:
+            chat_ids = _get_broadcast_chat_ids(token, chat_id)
+            ok = send_telegram_many(token, chat_ids, text) if chat_ids else False
+        else:
+            ok = send_telegram(token, chat_id, text)
+        if ok:
+            _log.append({"level": "info", "msg": "telegram_sent"})
+            logger.info("[telegram] sent")
+        else:
+            _log.append({"level": "warn", "msg": "telegram_failed"})
+            logger.warning("[telegram] failed")
+    except Exception as e:
+        try:
+            _log.append({"level": "error", "msg": f"telegram_error: {e}"})
+        except Exception:
+            pass
+        try:
+            logger.error(f"[telegram] error: {e}")
+        except Exception:
+            pass
 
 def _set_csv_file(path: str) -> None:
     runner.config["csv_file"] = path
@@ -264,6 +458,14 @@ def _on_step(s):
         if ep is not None and part is not None:
             t = _ensure_task(str(ep), int(part))
             t["stage"] = st
+            # Реалтайм TaskStatus: обновляем снапшот из живой автоматики
+            try:
+                k = _task_key(str(ep), int(part))
+                auto = _automation_refs.get(k)
+                if auto is not None and getattr(auto, "task_status", None) is not None:
+                    _task_status[k] = auto.task_status.model_dump()
+            except Exception:
+                pass
             if st == "start_part":
                 t["started_at"] = t.get("started_at") or _now_ts()
                 t["finished_at"] = None
@@ -276,6 +478,10 @@ def _on_step(s):
                 if rep is not None:
                     t["report"] = rep
                 _set_task_status(t, "success" if ok else "failed")
+                # Отправляем уведомление только если заполнена хотя бы одна сцена
+                scene_done = int(t.get('scene_done') or 0)
+                if scene_done > 0:
+                    _send_task_telegram(t, rep if isinstance(rep, dict) else t.get("report"))
             elif st == "start_scene":
                 _set_task_status(t, t.get("status") if t.get("status") != "queued" else "running")
             elif st == "finish_scene":
@@ -334,7 +540,13 @@ async def _run_one(ep: str, part: int) -> bool:
             update_project_status(ep, "running")
         except Exception:
             pass
-        auto = HeyGenAutomation(runner.csv_path, runner.config)
+            
+        if not await runner.automation.open_browser():
+            _set_task_status(tinfo, "failed")
+            tinfo["error"] = "Could not open browser"
+            return False
+
+        auto = HeyGenAutomation(runner.csv_path, runner.config, browser=runner.automation.browser, playwright=runner.automation.playwright)
         try:
             auto.df = runner.automation.df
         except Exception:
@@ -344,9 +556,22 @@ async def _run_one(ep: str, part: int) -> bool:
         except Exception:
             pass
         try:
+            template_url, scenes = auto.get_episode_data(ep, int(part))
+            tinfo["template_url"] = str(template_url or "").strip()
+            speakers = []
+            for s in scenes or []:
+                sp = s.get("speaker")
+                if sp:
+                    speakers.append(str(sp).strip())
+            if speakers:
+                tinfo["speakers"] = sorted({s for s in speakers if s})
+        except Exception:
+            pass
+        try:
             auto.pause_events = [_global_pause, pause_ev]
         except Exception:
             pass
+        _automation_refs[key] = auto
         ok = False
         rep_summary = None
         try:
@@ -357,6 +582,8 @@ async def _run_one(ep: str, part: int) -> bool:
         except Exception as e:
             _set_task_status(tinfo, "failed")
             tinfo["error"] = str(e)
+            if _is_browser_closed_error(str(e)):
+                _stop_all_tasks("browser_closed")
         if not ok and not str(tinfo.get("error") or ""):
             try:
                 last_err = str(getattr(auto, "_last_error", "") or "")
@@ -364,6 +591,10 @@ async def _run_one(ep: str, part: int) -> bool:
                 last_err = ""
             if last_err:
                 tinfo["error"] = last_err
+        try:
+            tinfo["project_status"] = "На генерации" if bool(getattr(auto, "_generation_enabled", lambda: False)()) else "Черновик"
+        except Exception:
+            pass
         try:
             rep = getattr(auto, "report", None)
         except Exception:
@@ -379,6 +610,22 @@ async def _run_one(ep: str, part: int) -> bool:
                 }
             except Exception:
                 rep_summary = None
+            try:
+                tinfo["report_details"] = {
+                    "validation_missing": _compact_report_entries(rep.get("validation_missing")),
+                    "broll_skipped": _compact_report_entries(rep.get("broll_skipped")),
+                    "broll_no_results": _compact_report_entries(rep.get("broll_no_results")),
+                    "broll_errors": _compact_report_entries(rep.get("broll_errors")),
+                    "manual_intervention": _compact_report_entries(rep.get("manual_intervention")),
+                }
+            except Exception:
+                pass
+        try:
+            ts = getattr(auto, "task_status", None)
+            if ts is not None:
+                _task_status[key] = ts.model_dump()
+        except Exception:
+            pass
         if events.on_step:
             payload = {"type": "finish_part", "episode": ep, "part": int(part), "ok": bool(ok)}
             if rep_summary is not None:
@@ -411,6 +658,55 @@ def _start_task(ep: str, part: int) -> None:
         finally:
             _active_tasks.pop(key, None)
     _active_tasks[key] = asyncio.create_task(_go())
+
+def _stop_all_tasks(reason: str) -> None:
+    global _progress
+    global _log
+    runner.stop()
+    try:
+        _progress = {"done": 0, "total": 0, "done_parts": 0, "total_parts": 0, "done_scenes": 0, "total_scenes": 0}
+    except Exception:
+        pass
+    try:
+        _global_pause.set()
+    except Exception:
+        pass
+    try:
+        for t in list(_active_tasks.values()):
+            if t is not None and not t.done():
+                t.cancel()
+    except Exception:
+        pass
+    try:
+        for ev in list(_task_pause.values()):
+            if ev is not None:
+                ev.set()
+    except Exception:
+        pass
+    try:
+        for k, t in list(_tasks.items()):
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("status")) in ("running", "paused", "queued"):
+                _set_task_status(t, "stopped")
+    except Exception:
+        pass
+    try:
+        _log.append({"level": "info", "msg": reason})
+    except Exception:
+        _log = [{"level": "info", "msg": reason}]
+    try:
+        from ui.state import get_projects, save_projects
+        items = get_projects()
+        changed = False
+        for pr in items:
+            if isinstance(pr, dict) and str(pr.get("status")) == "running":
+                pr["status"] = "pending"
+                changed = True
+        if changed:
+            save_projects(items)
+    except Exception:
+        pass
 
 def _plan_tasks_for_episodes(episodes: List[str]) -> Dict[str, Any]:
     planned = []
@@ -481,6 +777,18 @@ async def api_csv_upload(file: UploadFile = File(...)):
     with open(path, "wb") as f:
         f.write(await file.read())
     _set_csv_file(path)
+    try:
+        runner.automation.load_data()
+    except Exception as e:
+        try:
+            _log.append({"level": "error", "msg": f"csv_upload_failed: {e}"})
+        except Exception:
+            pass
+        try:
+            logger.error(f"[csv_upload] failed: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(runner.config, f, ensure_ascii=False, indent=2)
     await runner.load()
@@ -493,6 +801,18 @@ async def api_csv_text(text: str = Form(...)):
     path = os.path.join("uploads", "pasted.csv")
     df.to_csv(path, index=False)
     _set_csv_file(path)
+    try:
+        runner.automation.load_data()
+    except Exception as e:
+        try:
+            _log.append({"level": "error", "msg": f"csv_text_failed: {e}"})
+        except Exception:
+            pass
+        try:
+            logger.error(f"[csv_text] failed: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(runner.config, f, ensure_ascii=False, indent=2)
     await runner.load()
@@ -509,6 +829,17 @@ def api_progress():
 @app.get("/logs")
 def api_logs(limit: int = 2000):
     return _log[-limit:]
+
+@app.post("/telegram/sync")
+def api_telegram_sync():
+    token, chat_id, broadcast_all = _telegram_config()
+    if not token:
+        raise HTTPException(status_code=400, detail="telegram_bot_token missing")
+    chats = _get_broadcast_chat_ids(token, chat_id)
+    if not chats:
+        raise HTTPException(status_code=404, detail="no chats found")
+    _save_telegram_chats(chats)
+    return {"ok": True, "count": len(chats), "chats": chats}
 
 @app.post("/run")
 async def api_run(workflow: Optional[str] = Form(None)):
@@ -587,53 +918,7 @@ async def api_run_projects(payload: Dict[str, Any]):
 
 @app.post("/stop")
 def api_stop():
-    global _progress
-    global _log
-    runner.stop()
-    try:
-        _progress = {"done": 0, "total": 0, "done_parts": 0, "total_parts": 0, "done_scenes": 0, "total_scenes": 0}
-    except Exception:
-        pass
-    try:
-        _global_pause.set()
-    except Exception:
-        pass
-    try:
-        for t in list(_active_tasks.values()):
-            if t is not None and not t.done():
-                t.cancel()
-    except Exception:
-        pass
-    try:
-        for ev in list(_task_pause.values()):
-            if ev is not None:
-                ev.set()
-    except Exception:
-        pass
-    try:
-        for k, t in list(_tasks.items()):
-            if not isinstance(t, dict):
-                continue
-            if str(t.get("status")) == "running" or str(t.get("status")) == "paused":
-                _set_task_status(t, "stopped")
-    except Exception:
-        pass
-    try:
-        _log.append({"level": "info", "msg": "stopped"})
-    except Exception:
-        _log = [{"level": "info", "msg": "stopped"}]
-    try:
-        from ui.state import get_projects, save_projects
-        items = get_projects()
-        changed = False
-        for pr in items:
-            if isinstance(pr, dict) and str(pr.get("status")) == "running":
-                pr["status"] = "pending"
-                changed = True
-        if changed:
-            save_projects(items)
-    except Exception:
-        pass
+    _stop_all_tasks("stopped")
     return {"ok": True}
 
 @app.post("/pause")
@@ -679,6 +964,45 @@ def api_tasks(episode: Optional[str] = Query(None)):
     prio = {"running": 0, "paused": 1, "queued": 2, "stopped": 3, "failed": 4, "success": 5}
     out.sort(key=lambda x: (prio.get(str(x.get("status")), 99), str(x.get("episode")), int(x.get("part") or 0)))
     return {"tasks": out}
+
+@app.post("/run-workflow")
+async def api_run_workflow(payload: Dict[str, Any]):
+    episode = str((payload or {}).get("episode") or "").strip()
+    part = (payload or {}).get("part")
+    workflow = (payload or {}).get("workflow")
+    if not episode or part is None:
+        raise HTTPException(status_code=400, detail="episode and part required")
+    try:
+        _apply_workflow_settings(str(workflow or "") or None)
+    except Exception:
+        pass
+    try:
+        await runner.load()
+    except Exception:
+        pass
+    _start_task(episode, int(part))
+    return {"id": _task_key(episode, int(part))}
+
+@app.get("/task/{tid}/status")
+def api_task_status(tid: str):
+    k = str(tid or "")
+    if k in _task_status:
+        return _task_status[k]
+    t = _tasks.get(k)
+    if isinstance(t, dict):
+        # Fallback minimal status
+        return {
+            "task_id": k,
+            "steps": [],
+            "metrics": {
+                "scenes_total": int(t.get("scene_total") or 0),
+                "scenes_completed": int(t.get("scene_done") or 0),
+                "brolls_total": 0,
+                "brolls_inserted": 0,
+            },
+            "global_status": str(t.get("status") or "queued"),
+        }
+    raise HTTPException(status_code=404, detail="task not found")
 
 @app.post("/tasks/{episode}/{part}/pause")
 def api_task_pause(episode: str, part: int):
@@ -744,18 +1068,115 @@ def api_task_start(episode: str, part: int):
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True}
 
+@app.post("/browser/open")
+async def api_open_browser(payload: Dict[str, Any] = None):
+    try:
+        cfg = runner.config
+        
+        # Если передан профиль, обновляем конфиг
+        if payload and "profile" in payload:
+            profile_name = str(payload["profile"]).strip()
+            if profile_name:
+                cfg["profile_to_use"] = profile_name
+                # Сохраняем выбор в файл
+                try:
+                    with open("config.json", "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+        profile_to_use = cfg.get('profile_to_use', '')
+        profiles = cfg.get('profiles', {})
+        profile = profiles.get(profile_to_use, {}) if profile_to_use else {}
+        
+        ok = await runner.automation.open_browser()
+        if not ok:
+            profile_info = ""
+            if profile_to_use:
+                browser_type = profile.get('browser_type', 'chrome' if profile.get('cdp_url') else 'chromium')
+                cdp_url = profile.get('cdp_url', '')
+                if browser_type == 'chrome' and cdp_url:
+                    profile_info = f" Профиль: {profile_to_use}, CDP: {cdp_url}. Убедитесь, что Chrome запущен с remote debugging на этом порту."
+                else:
+                    profile_info = f" Профиль: {profile_to_use} (Chromium)."
+            raise RuntimeError(f"Не удалось открыть браузер.{profile_info}")
+        try:
+            _log.append({"level": "info", "msg": "browser_opened"})
+        except Exception:
+            pass
+        try:
+            logger.info("[open_browser] success")
+        except Exception:
+            pass
+        return {"ok": True}
+    except RuntimeError:
+        raise
+    except Exception as e:
+        try:
+            _log.append({"level": "error", "msg": f"browser_open_failed: {e}"})
+        except Exception:
+            pass
+        try:
+            logger.error(f"[open_browser] failed: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Ошибка открытия браузера: {str(e)}")
+
+@app.post("/inspector/start")
+def api_start_inspector(payload: Dict[str, Any]):
+    try:
+        url = str((payload or {}).get("url") or "").strip()
+        target = str((payload or {}).get("target") or "").strip()
+        headless = bool((payload or {}).get("headless", False))
+        if not url:
+            url = "https://app.heygen.com/projects"
+        cmd = [sys.executable, "tools/inspector.py", url]
+        if target:
+            cmd.extend(["--target", target])
+        if headless:
+            cmd.append("--headless")
+        env = os.environ.copy()
+        env.setdefault("PWDEBUG", "1")
+        subprocess.Popen(cmd, env=env)
+        try:
+            _log.append({"level": "info", "msg": f"inspector_started: {url}"})
+        except Exception:
+            pass
+        try:
+            logger.info(f"[inspector_start] success: {url}")
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as e:
+        try:
+            _log.append({"level": "error", "msg": f"inspector_failed: {e}"})
+        except Exception:
+            pass
+        try:
+            logger.error(f"[inspector_start] failed: {e}")
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/config")
 def api_get_config():
     return runner.config
 
 @app.put("/config")
-def api_put_config(payload: Dict[str, Any]):
+async def api_put_config(payload: Dict[str, Any]):
     cfg = runner.config
+    old_csv = cfg.get("csv_file")
     for k, v in (payload or {}).items():
         cfg[k] = v
     with open("config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     runner.config = cfg
+    # Reload CSV if csv_file was changed
+    new_csv = cfg.get("csv_file")
+    if new_csv and new_csv != old_csv:
+        runner.csv_path = new_csv
+        runner.automation.csv_path = new_csv
+        await runner.load()
     return {"ok": True}
 
 @app.get("/episodes")
@@ -881,3 +1302,373 @@ def api_put_workflow(name: str, payload: Dict[str, Any]):
     wf = Workflow(**payload)
     save_workflow(wf, p)
     return {"ok": True}
+
+
+# ======================= VIDEO ENDPOINTS =======================
+from ui.state import (
+    get_videos, save_videos, get_video_list, add_video, 
+    update_video, delete_video as state_delete_video, 
+    bulk_add_videos, set_last_scraped, _now_iso
+)
+from ui.postprocess import ffmpeg_concat_advanced, get_video_info, format_file_size, format_duration
+
+
+@app.get("/videos")
+def api_get_videos():
+    """Get all videos from state"""
+    data = get_videos()
+    return data
+
+
+@app.post("/videos/scrape")
+async def api_scrape_videos(payload: Dict[str, Any] = None):
+    """Scrape videos from HeyGen projects page"""
+    max_count = (payload or {}).get("max_count", 30)
+    
+    try:
+        # Check if we can connect to browser
+        from ui.video_scraper import scrape_heygen_videos
+        
+        _log.append({"level": "info", "msg": f"Starting video scrape, max_count={max_count}"})
+        logger.info(f"[scrape_videos] Starting, max_count={max_count}")
+        
+        # Get already scraped titles to skip
+        existing = get_video_list()
+        already_scraped = {v.get("title") for v in existing if v.get("title")}
+        _log.append({"level": "info", "msg": f"Already have {len(already_scraped)} videos in database"})
+        
+        # Use existing automation page if available
+        auto = runner.automation
+        # HeyGenAutomation uses _page attribute
+        current_page = getattr(auto, '_page', None)
+        
+        # Check if page is still valid (not closed)
+        page_valid = False
+        if current_page is not None:
+            try:
+                # Try to check if page is still open
+                if not current_page.is_closed():
+                    page_valid = True
+            except Exception:
+                pass
+        
+        if not page_valid:
+            _log.append({"level": "info", "msg": "Opening browser..."})
+            logger.info("[scrape_videos] Opening browser...")
+            # Reset page reference
+            auto._page = None
+            # Try to open browser
+            ok = await auto.open_browser()
+            if not ok:
+                _log.append({"level": "error", "msg": "Could not connect to browser"})
+                raise HTTPException(status_code=500, detail="Could not connect to browser. Make sure Chrome is running with remote debugging enabled.")
+            current_page = getattr(auto, '_page', None)
+            if current_page is None:
+                raise HTTPException(status_code=500, detail="Browser opened but page not available")
+        
+        page = current_page
+        _log.append({"level": "info", "msg": "Browser connected, starting scrape..."})
+        logger.info("[scrape_videos] Browser connected, starting scrape...")
+        
+        # Scrape videos
+        videos = await scrape_heygen_videos(page, max_count=max_count, already_scraped_titles=already_scraped)
+        
+        _log.append({"level": "info", "msg": f"Scrape complete, found {len(videos)} new videos"})
+        
+        # Save to state
+        added = bulk_add_videos(videos)
+        
+        _log.append({"level": "info", "msg": f"Saved {len(added)} videos to database"})
+        logger.info(f"[scrape_videos] scraped {len(added)} videos")
+        
+        return {"ok": True, "count": len(added), "videos": added}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        _log.append({"level": "error", "msg": f"scrape_videos_failed: {e}"})
+        _log.append({"level": "error", "msg": error_details})
+        logger.error(f"[scrape_videos] failed: {e}")
+        logger.error(error_details)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/videos/{video_id}/download")
+async def api_download_video(video_id: str):
+    """Download a single video by ID"""
+    try:
+        videos = get_video_list()
+        video = None
+        for v in videos:
+            if v.get("id") == video_id:
+                video = v
+                break
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get download directory from config
+        download_dir = str(runner.config.get("download_dir") or "./downloads")
+        os.makedirs(download_dir, exist_ok=True)
+        
+        file_path = None
+        
+        # If we have a direct download URL, use it
+        if video.get("download_url"):
+            from ui.video_scraper import download_video_by_url
+            filename = f"{video.get('title', 'video')}_{video_id[:8]}.mp4"
+            file_path = await download_video_by_url(
+                video["download_url"], 
+                download_dir, 
+                filename
+            )
+        else:
+            # Otherwise, navigate to the video and download via browser
+            from ui.video_scraper import download_single_video
+            
+            auto = runner.automation
+            current_page = getattr(auto, '_page', None)
+            
+            # Check if page is still valid (not closed)
+            page_valid = False
+            if current_page is not None:
+                try:
+                    if not current_page.is_closed():
+                        page_valid = True
+                except Exception:
+                    pass
+            
+            if not page_valid:
+                auto._page = None  # Reset reference
+                ok = await auto.open_browser()
+                if not ok:
+                    raise HTTPException(status_code=500, detail="Could not connect to browser")
+                current_page = getattr(auto, '_page', None)
+                if current_page is None:
+                    raise HTTPException(status_code=500, detail="Browser opened but page not available")
+            
+            file_path = await download_single_video(
+                current_page, 
+                video.get("title", ""), 
+                download_dir
+            )
+        
+        if file_path and os.path.isfile(file_path):
+            # Update video info
+            info = get_video_info(file_path)
+            updates = {"file_path": file_path, "status": "downloaded"}
+            if info:
+                updates["size"] = format_file_size(info.get("size", 0))
+                updates["duration"] = format_duration(info.get("duration", 0))
+            
+            update_video(video_id, updates)
+            
+            _log.append({"level": "info", "msg": f"downloaded video: {video.get('title')}"})
+            logger.info(f"[download_video] success: {file_path}")
+            
+            return {"ok": True, "file_path": file_path, "size": updates.get("size")}
+        else:
+            raise HTTPException(status_code=500, detail="Download failed")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.append({"level": "error", "msg": f"download_video_failed: {e}"})
+        logger.error(f"[download_video] failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/videos/download-batch")
+async def api_download_batch(payload: Dict[str, Any]):
+    """Download multiple videos by IDs"""
+    video_ids = payload.get("video_ids") or []
+    if not video_ids:
+        raise HTTPException(status_code=400, detail="video_ids required")
+    
+    results = []
+    errors = []
+    
+    for vid in video_ids:
+        try:
+            result = await api_download_video(vid)
+            results.append({"id": vid, "ok": True, "file_path": result.get("file_path")})
+        except Exception as e:
+            errors.append({"id": vid, "error": str(e)})
+    
+    return {"ok": True, "downloaded": len(results), "errors": errors, "results": results}
+
+
+@app.post("/videos/merge")
+async def api_merge_videos(payload: Dict[str, Any]):
+    """Merge selected videos using FFmpeg"""
+    video_ids = payload.get("video_ids") or []
+    output_name = payload.get("output_name") or f"merged_{int(time.time())}.mp4"
+    
+    if not video_ids or len(video_ids) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 video_ids required")
+    
+    try:
+        videos = get_video_list()
+        videos_by_id = {v.get("id"): v for v in videos}
+        
+        # Collect input file paths in order
+        input_files = []
+        missing = []
+        
+        for vid in video_ids:
+            video = videos_by_id.get(vid)
+            if not video:
+                missing.append(vid)
+                continue
+            
+            file_path = video.get("file_path")
+            if not file_path or not os.path.isfile(file_path):
+                missing.append(vid)
+                continue
+            
+            input_files.append(file_path)
+        
+        if missing:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Missing or not downloaded videos: {missing}"
+            )
+        
+        # Get video quality settings from config
+        bitrate = int(runner.config.get("video_bitrate_kbps") or 5000)
+        resolution = str(runner.config.get("video_resolution") or "1080p")
+        video_codec = str(runner.config.get("video_codec") or "h264")
+        audio_codec = str(runner.config.get("audio_codec") or "aac")
+        
+        # Output path
+        download_dir = str(runner.config.get("download_dir") or "./downloads")
+        os.makedirs(download_dir, exist_ok=True)
+        output_path = os.path.join(download_dir, output_name)
+        
+        # Run FFmpeg merge
+        _log.append({"level": "info", "msg": f"merging {len(input_files)} videos..."})
+        logger.info(f"[merge_videos] merging {len(input_files)} videos to {output_path}")
+        
+        return_code = ffmpeg_concat_advanced(
+            inputs=input_files,
+            output_path=output_path,
+            bitrate_kbps=bitrate,
+            resolution=resolution,
+            video_codec=video_codec,
+            audio_codec=audio_codec
+        )
+        
+        if return_code != 0:
+            raise HTTPException(status_code=500, detail="FFmpeg merge failed")
+        
+        # Get output file info
+        info = get_video_info(output_path)
+        size_str = format_file_size(info.get("size", 0)) if info else None
+        duration_str = format_duration(info.get("duration", 0)) if info else None
+
+        try:
+            merged_entry = {
+                "title": output_name,
+                "file_path": output_path,
+                "size": size_str,
+                "duration": duration_str,
+                "duration_sec": info.get("duration") if info else None,
+                "merged": True,
+                "created_at": _now_iso(),
+            }
+            add_video(merged_entry)
+        except Exception:
+            pass
+        
+        _log.append({"level": "info", "msg": f"merge complete: {output_path}"})
+        logger.info(f"[merge_videos] complete: {output_path}")
+        
+        return {
+            "ok": True, 
+            "output_path": output_path,
+            "size": size_str,
+            "duration": duration_str,
+            "video_count": len(input_files)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.append({"level": "error", "msg": f"merge_videos_failed: {e}"})
+        logger.error(f"[merge_videos] failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/videos/{video_id}")
+def api_delete_video(video_id: str):
+    """Delete a video from state (optionally delete file)"""
+    videos = get_video_list()
+    video = None
+    for v in videos:
+        if v.get("id") == video_id:
+            video = v
+            break
+    
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    # Delete the file if it exists
+    file_path = video.get("file_path")
+    if file_path and os.path.isfile(file_path):
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            logger.warning(f"Could not delete file {file_path}: {e}")
+    
+    # Remove from state
+    state_delete_video(video_id)
+    
+    return {"ok": True}
+
+
+@app.post("/videos/clear")
+def api_clear_videos():
+    """Clear all videos from state"""
+    from ui.state import clear_videos
+    clear_videos()
+    return {"ok": True}
+
+
+@app.put("/videos/{video_id}")
+def api_update_video(video_id: str, payload: Dict[str, Any]):
+    """Update video metadata"""
+    result = update_video(video_id, payload)
+    if not result:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"ok": True, "video": result}
+
+
+@app.post("/reveal-in-finder")
+def api_reveal_in_finder(payload: Dict[str, Any]):
+    """Open file in Finder (macOS) or file explorer"""
+    file_path = payload.get("path")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="Path required")
+    
+    import subprocess
+    import platform
+    
+    abs_path = os.path.abspath(file_path)
+    
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {abs_path}")
+    
+    try:
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            subprocess.run(["open", "-R", abs_path], check=True)
+        elif system == "Windows":
+            subprocess.run(["explorer", "/select,", abs_path], check=True)
+        else:  # Linux
+            subprocess.run(["xdg-open", os.path.dirname(abs_path)], check=True)
+        
+        return {"ok": True, "path": abs_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

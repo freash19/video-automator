@@ -1,24 +1,35 @@
 import asyncio
 import pandas as pd
 import random
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, Locator
 import os
 import json
 import re
 import argparse
 import subprocess
+import sys
+from typing import Awaitable, Callable, Any
+from ui.step_wrapper import step
+from ui.logger import logger
+from automation_models import TaskStatus, AutomationStep, Metrics, StepStatus
+from core.broll import select_media_source, select_orientation
 
 class HeyGenAutomation:
-    def __init__(self, csv_path: str, config: dict):
+    def __init__(self, csv_path: str, config: dict, browser=None, playwright=None):
         """
         Инициализация автоматизации HeyGen
         
         Args:
             csv_path: Путь к CSV файлу со сценариями
+            config: Конфигурация
+            browser: Опциональный объект браузера Playwright
+            playwright: Опциональный объект Playwright
         """
         self.csv_path = csv_path
         self.df = None
         self.config = config or {}
+        self.browser = browser
+        self.playwright = playwright
         self.max_scenes = int(self.config.get('max_scenes', 15))
         self.pre_fill_wait = float(self.config.get('pre_fill_wait', 1.0))
         self.delay_between_scenes = float(self.config.get('delay_between_scenes', 2.5))
@@ -41,6 +52,7 @@ class HeyGenAutomation:
         self.orientation_choice = str(self.config.get('orientation_choice', 'Горизонтальная'))
         self.media_source = str(self.config.get('media_source', 'all')).lower()
         self.enable_notifications = bool(self.config.get('enable_notifications', False))
+        self.verify_scene_after_insert = bool(self.config.get('verify_scene_after_insert', True))
         self._broll_delay_range = (
             float(self.config.get('broll_step_delay_min_sec', 0.25)),
             float(self.config.get('broll_step_delay_max_sec', 0.55)),
@@ -56,6 +68,12 @@ class HeyGenAutomation:
         self._current_episode_id = None
         self._current_part_idx = None
         self._last_error = ""
+        self._page = None
+        self.task_status: TaskStatus | None = None
+        try:
+            os.makedirs("debug/screenshots", exist_ok=True)
+        except Exception:
+            pass
 
     def _coerce_scalar(self, v):
         if isinstance(v, pd.Series):
@@ -85,6 +103,72 @@ class HeyGenAutomation:
             pass
         s = str(v2)
         return s.strip()
+
+    def _normalize_speaker_key(self, speaker: str | None) -> str | None:
+        if not speaker:
+            return None
+        s = str(speaker).strip()
+        if not s:
+            return None
+        compact = re.sub(r"[^a-zA-Z0-9]+", " ", s).strip().lower()
+        mapping = {
+            "dr peter": "Dr_Peter",
+            "doctor peter": "Dr_Peter",
+            "peter": "Dr_Peter",
+            "michael": "Michael",
+            "hiroshi": "Hiroshi",
+        }
+        if compact in mapping:
+            return mapping[compact]
+        safe = re.sub(r"[^a-zA-Z0-9_\-]+", "_", s).strip("_")
+        return safe or None
+
+    def _generation_enabled(self) -> bool:
+        return bool(self.config.get("enable_generation", True))
+
+    async def _apply_part_title(self, page: Page, title: str) -> bool:
+        t = str(title or "").strip()
+        if not t:
+            return True
+        await self._await_gate()
+        locator = page.get_by_role("textbox", name=re.compile(r"Без названия — видео", re.I))
+        try:
+            if await locator.count() == 0:
+                locator = page.get_by_role("textbox", name=re.compile(r"Untitled", re.I))
+        except Exception:
+            pass
+        try:
+            if await locator.count() == 0:
+                return False
+        except Exception:
+            return False
+        try:
+            await locator.first.click(timeout=8000)
+        except Exception:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            try:
+                await locator.first.click(timeout=8000, force=True)
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+        try:
+            await locator.first.fill(t)
+        except Exception:
+            try:
+                handle = await locator.first.element_handle()
+                if handle:
+                    await page.evaluate(
+                        "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
+                        handle,
+                        t,
+                    )
+            except Exception:
+                return False
+        await asyncio.sleep(0.05)
+        return True
 
     def normalize_text_for_compare(self, text: str) -> str:
         try:
@@ -135,10 +219,73 @@ class HeyGenAutomation:
             except Exception:
                 continue
 
+    async def perform_step(self, name: str, action_func: Callable[[], Awaitable[Any]], critical: bool = True):
+        step_rec = AutomationStep(name=name, status=StepStatus.PENDING)
+        if self.task_status is None:
+            self.task_status = TaskStatus(task_id=f"{self._current_episode_id}:{self._current_part_idx}")
+        self.task_status.steps.append(step_rec)
+        try:
+            logger.info(f"[{name}] start")
+            res = await action_func()
+            if res is False:
+                if critical:
+                    step_rec.status = StepStatus.FAILED
+                    logger.error(f"[{name}] failed")
+                    if self.task_status:
+                        self.task_status.global_status = "failed"
+                    raise RuntimeError(f"{name} failed")
+                step_rec.status = StepStatus.SKIPPED
+                logger.warning(f"[{name}] skipped")
+                return False
+            step_rec.status = StepStatus.SUCCESS
+            logger.info(f"[{name}] success")
+            return res
+        except asyncio.CancelledError:
+            step_rec.status = StepStatus.FAILED
+            logger.error(f"[{name}] cancelled")
+            raise
+        except Exception as e:
+            err = str(e)
+            step_rec.status = StepStatus.FAILED if critical else StepStatus.SKIPPED
+            step_rec.error_message = err
+            try:
+                page = getattr(self, "_page", None)
+                if page:
+                    safe = "".join(ch for ch in name if ch.isalnum() or ch in "_-")
+                    ts = int(asyncio.get_event_loop().time() * 1000)
+                    path = f"debug/screenshots/{safe}_{ts}.png"
+                    try:
+                        await page.screenshot(path=path, full_page=True)
+                        step_rec.screenshot_path = path
+                    except Exception as se:
+                        logger.error(f"[{name}] screenshot_failed: {se}")
+            except Exception:
+                pass
+            try:
+                logger.error(f"[{name}] failed: {err}")
+                self._last_error = err
+                if self.task_status and critical:
+                    self.task_status.global_status = "failed"
+            except Exception:
+                pass
+            if critical:
+                raise
+            return None
+
     def _block_generation_reason(self) -> str:
         if not self.report:
             return ""
         reasons = []
+        try:
+            if self.report.get('validation_missing'):
+                reasons.append(f"несоответствия: {len(self.report.get('validation_missing') or [])}")
+        except Exception:
+            pass
+        try:
+            if self.report.get('broll_skipped'):
+                reasons.append(f"пропуски B-roll: {len(self.report.get('broll_skipped') or [])}")
+        except Exception:
+            pass
         try:
             if self.report.get('broll_errors'):
                 reasons.append(f"ошибки B-roll: {len(self.report.get('broll_errors') or [])}")
@@ -149,11 +296,28 @@ class HeyGenAutomation:
                 reasons.append(f"B-roll без результатов: {len(self.report.get('broll_no_results') or [])}")
         except Exception:
             pass
+        try:
+            if self.task_status and self.task_status.steps:
+                skipped = [s for s in self.task_status.steps if s.status == StepStatus.SKIPPED]
+                if skipped:
+                    reasons.append(f"пропущенные шаги: {len(skipped)}")
+        except Exception:
+            pass
         return "; ".join(reasons)
 
     def _should_block_generation(self) -> bool:
         if not self.report:
             return False
+        try:
+            if self.report.get('validation_missing'):
+                return True
+        except Exception:
+            pass
+        try:
+            if self.report.get('broll_skipped'):
+                return True
+        except Exception:
+            pass
         try:
             if self.report.get('broll_errors'):
                 return True
@@ -162,6 +326,13 @@ class HeyGenAutomation:
         try:
             if self.report.get('broll_no_results'):
                 return True
+        except Exception:
+            pass
+        try:
+            if self.task_status and self.task_status.steps:
+                for s in self.task_status.steps:
+                    if s.status == StepStatus.SKIPPED:
+                        return True
         except Exception:
             pass
         return False
@@ -222,6 +393,7 @@ class HeyGenAutomation:
             pass
         return False
 
+    @step("open_media_panel")
     async def _open_media_panel(self, page: Page) -> bool:
         try:
             panel_header = page.locator('h2').filter(has_text=re.compile(r'^\s*(Медиа|Media)\s*$'))
@@ -264,26 +436,108 @@ class HeyGenAutomation:
         return False
 
     async def _select_video_tab(self, page: Page) -> bool:
+        async def _is_active(loc: Locator) -> bool:
+            try:
+                v = await loc.get_attribute("aria-selected")
+                if v and str(v).lower() == "true":
+                    return True
+            except Exception:
+                pass
+            try:
+                v = await loc.get_attribute("data-state")
+                if v and str(v).lower() in ("active", "on", "open"):
+                    return True
+            except Exception:
+                pass
+            try:
+                v = await loc.get_attribute("data-active")
+                if v and str(v).lower() in ("true", "1"):
+                    return True
+            except Exception:
+                pass
+            try:
+                v = await loc.get_attribute("aria-current")
+                if v and str(v).lower() in ("true", "page", "tab"):
+                    return True
+            except Exception:
+                pass
+            return False
+        try:
+            ready = await self._locate_broll_search_input(page)
+            if ready is not None:
+                return True
+        except Exception:
+            pass
         for name in ("Видео", "Video"):
             try:
                 tab = page.get_by_role('tab', name=name)
                 if await tab.count() > 0:
+                    if await _is_active(tab.first):
+                        return True
                     if await self._try_click(tab.first, page, timeout_ms=8000):
                         await self._broll_pause(0.15)
+                        try:
+                            ready = await self._locate_broll_search_input(page)
+                            if ready is not None:
+                                return True
+                        except Exception:
+                            return True
+            except Exception:
+                pass
+            try:
+                btn = page.get_by_role('button', name=name)
+                if await btn.count() > 0:
+                    if await _is_active(btn.first):
                         return True
+                    if await self._try_click(btn.first, page, timeout_ms=8000):
+                        await self._broll_pause(0.15)
+                        try:
+                            ready = await self._locate_broll_search_input(page)
+                            if ready is not None:
+                                return True
+                        except Exception:
+                            return True
             except Exception:
                 pass
         try:
             vid_tab = page.locator('button[role="tab"]').filter(has_text=re.compile(r'^\s*(Видео|Video)\s*$'))
             if await vid_tab.count() > 0:
+                if await _is_active(vid_tab.first):
+                    return True
                 if await self._try_click(vid_tab.first, page, timeout_ms=8000):
                     await self._broll_pause(0.15)
+                    try:
+                        ready = await self._locate_broll_search_input(page)
+                        if ready is not None:
+                            return True
+                    except Exception:
+                        return True
+        except Exception:
+            pass
+        try:
+            fallback = page.locator('[role="tab"], [role="button"]').filter(has_text=re.compile(r'\b(Видео|Video)\b'))
+            if await fallback.count() > 0:
+                if await _is_active(fallback.first):
                     return True
+                if await self._try_click(fallback.first, page, timeout_ms=8000):
+                    await self._broll_pause(0.15)
+                    try:
+                        ready = await self._locate_broll_search_input(page)
+                        if ready is not None:
+                            return True
+                    except Exception:
+                        return True
         except Exception:
             pass
         return False
 
     async def _locate_broll_search_input(self, page: Page):
+        try:
+            inp = page.get_by_role("textbox", name=re.compile(r"(Искать видео онлайн|Search videos online)", re.I))
+            if await inp.count() > 0:
+                return inp.first
+        except Exception:
+            pass
         selectors = [
             'input[placeholder*="Искать"][placeholder*="онлайн"]',
             'input[placeholder="Искать видео онлайн"]',
@@ -301,12 +555,92 @@ class HeyGenAutomation:
                 continue
         return None
 
+    async def _locate_broll_result_card(self, page: Page):
+        candidates = [
+            page.locator('[role="option"]'),
+            page.locator('[role="listitem"]'),
+            page.locator('[role="button"][aria-label*="video" i]'),
+            page.locator('[role="button"][aria-label*="видео" i]'),
+            page.locator('div.tw-group').filter(has=page.locator('img, video')),
+            page.locator('[role="button"]').filter(has=page.locator('img, video')),
+        ]
+        for loc in candidates:
+            try:
+                if await loc.count() > 0:
+                    return loc.first
+            except Exception:
+                continue
+        return None
+
+    async def _read_locator_text(self, locator: Locator) -> str:
+        try:
+            val = await locator.inner_text(timeout=1500)
+            if val is not None:
+                return str(val)
+        except Exception:
+            pass
+        try:
+            val = await locator.text_content(timeout=1500)
+            if val is not None:
+                return str(val)
+        except Exception:
+            pass
+        return ""
+
+    async def _fast_replace_text(self, page: Page, locator: Locator, text: str) -> None:
+        try:
+            await locator.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await locator.click(timeout=3000)
+        except Exception:
+            try:
+                await locator.click(timeout=3000, force=True)
+            except Exception:
+                pass
+        await self._await_gate()
+        try:
+            await page.keyboard.press('Meta+A')
+            await asyncio.sleep(0.05)
+            await page.keyboard.press('Backspace')
+            await asyncio.sleep(0.05)
+            await page.keyboard.insert_text(text)
+            await asyncio.sleep(0.1)
+            await page.keyboard.press('Tab')
+        except Exception:
+            pass
+
+    async def _verify_scene_text(self, page: Page, locator: Locator, expected: str) -> bool:
+        target = str(expected or "").strip()
+        if not target:
+            return True
+        for attempt in range(3):
+            await self._await_gate()
+            await asyncio.sleep(0.2)
+            try:
+                matches = page.get_by_text(target, exact=True)
+                if await matches.count() > 0:
+                    return True
+            except Exception:
+                pass
+            if attempt == 0:
+                await self._fast_replace_text(page, locator, expected)
+            else:
+                try:
+                    await page.keyboard.press('Tab')
+                except Exception:
+                    pass
+        self._emit_notice("❌ scene_verify_failed")
+        return False
+
+    @step("confirm_broll_added")
     async def _confirm_broll_added(self, page: Page, min_wait_sec: float = 0.0) -> bool:
         try:
             if min_wait_sec and min_wait_sec > 0:
                 await self._broll_pause(float(min_wait_sec))
             for _ in range(50):
-                busy = page.locator('[aria-busy="true"], .tw-animate-spin, svg.tw-animate-spin')
+                busy = page.locator('[aria-busy="true"]')
                 try:
                     if await busy.count() > 0:
                         await self._broll_pause(0.2)
@@ -517,7 +851,8 @@ class HeyGenAutomation:
         
         return template_url, scenes
     
-    async def fill_scene(self, page: Page, scene_number: int, text: str):
+    @step("fill_scene")
+    async def fill_scene(self, page: Page, scene_number: int, text: str, speaker: str | None = None):
         """
         Заполнить конкретную сцену текстом
         
@@ -544,114 +879,137 @@ class HeyGenAutomation:
                 self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
                 return False
             
-            # Кликаем на span с устойчивыми попытками
-            await self._await_gate()
-            await span_locator.first.scroll_into_view_if_needed()
-            await asyncio.sleep(0.05)
-            try:
-                await page.keyboard.press('Escape')
-            except Exception:
-                pass
-            try:
-                await span_locator.first.click(timeout=3000)
-            except Exception:
+            safe_speaker = self._normalize_speaker_key(speaker)
+
+            async def _select_scene():
+                await self._await_gate()
+                await span_locator.first.scroll_into_view_if_needed()
+                await asyncio.sleep(0.05)
                 try:
-                    await span_locator.first.click(timeout=3000, force=True)
+                    await page.keyboard.press('Escape')
+                except Exception:
+                    pass
+                try:
+                    await span_locator.first.click(timeout=3000)
                 except Exception:
                     try:
-                        box = await span_locator.first.bounding_box()
-                        if box:
-                            await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                        await span_locator.first.click(timeout=3000, force=True)
                     except Exception:
-                        self._emit_notice(f"❌ scene_focus_failed: scene={scene_number} label={text_label}")
-                        self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                        try:
+                            box = await span_locator.first.bounding_box()
+                            if box:
+                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                                return True
+                        except Exception:
+                            return False
                         return False
-            await self._await_gate()
-            await asyncio.sleep(random.uniform(0.1, 0.2))
-            try:
-                s_over = (self.config.get('step_overrides') or {}).get('fill_scene') or {}
-                extra_delay = float(s_over.get('delay_sec', 0))
-                if extra_delay > 0:
-                    await asyncio.sleep(extra_delay)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            
-            # Очищаем содержимое
-            await self._await_gate()
-            await page.keyboard.press('Meta+A')
-            await asyncio.sleep(0.05)
-            await page.keyboard.press('Backspace')
-            await asyncio.sleep(random.uniform(0.05, 0.1))
-            
-            # Вставляем текст
-            await self._await_gate()
-            await page.keyboard.insert_text(text)
-            await asyncio.sleep(random.uniform(0.1, 0.2))
-            await page.keyboard.press('Tab')
-            await asyncio.sleep(random.uniform(0.1, 0.2))
-            try:
-                if bool(self.config.get('enable_enhance_voice', False)):
-                    btn = page.locator('button#voice-enhancement-jeFjSzUn:has-text("Enhance Voice")')
-                    if await btn.count() == 0:
-                        btn = page.locator('button:has(iconpark-icon[name="director-mode"])').filter(has_text=re.compile(r'^\s*Enhance Voice\s*$'))
-                    if await btn.count() > 0:
-                        await btn.first.click(timeout=3000)
-                        await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            try:
-                current_text = await span_locator.first.inner_text(timeout=1500)
-                if current_text.strip() != text.strip():
-                    for _ in range(2):
-                        await span_locator.first.click()
-                        await asyncio.sleep(0.1)
-                        await page.keyboard.press('Meta+A')
-                        await asyncio.sleep(0.05)
-                        await page.keyboard.press('Backspace')
-                        await asyncio.sleep(0.05)
-                        await page.keyboard.insert_text(text)
-                        await asyncio.sleep(0.1)
-                        await page.keyboard.press('Tab')
-                        await asyncio.sleep(0.2)
-                        current_text = await span_locator.first.inner_text()
-                        if current_text.strip() == text.strip():
-                            break
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-
-            # Дополнительно: нажать кнопку усиления голоса, если доступна
-            if self.config.get('enable_enhance_voice'):
+                await self._await_gate()
+                await asyncio.sleep(random.uniform(0.1, 0.2))
                 try:
-                    enhance_buttons = page.locator('button:has(iconpark-icon[name="director-mode"])').filter(has_text=re.compile(r'Enhance Voice|Усилить голос'))
-                    button_count = await enhance_buttons.count()
-                    if button_count > 0:
-                        await enhance_buttons.last.click()
-                        await asyncio.sleep(0.3)
+                    s_over = (self.config.get('step_overrides') or {}).get('fill_scene') or {}
+                    extra_delay = float(s_over.get('delay_sec', 0))
+                    if extra_delay > 0:
+                        await asyncio.sleep(extra_delay)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                return True
+
+            step_name_select = f"select_scene_{scene_number}" if not safe_speaker else f"select_scene_{scene_number}_{safe_speaker}"
+            ok_select = await self.perform_step(step_name_select, _select_scene, critical=True)
+            if not ok_select:
+                self._emit_notice(f"❌ scene_focus_failed: scene={scene_number} label={text_label}")
+                self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                return False
+
+            async def _insert_text():
+                await self._await_gate()
+                await page.keyboard.press('Meta+A')
+                await asyncio.sleep(0.05)
+                await page.keyboard.press('Backspace')
+                await asyncio.sleep(random.uniform(0.05, 0.1))
+
+                await self._await_gate()
+                await page.keyboard.insert_text(text)
+                await asyncio.sleep(random.uniform(0.1, 0.2))
+                await page.keyboard.press('Tab')
+                await asyncio.sleep(random.uniform(0.1, 0.2))
+                try:
+                    if bool(self.config.get('enable_enhance_voice', False)):
+                        btn = page.locator('button#voice-enhancement-jeFjSzUn:has-text("Enhance Voice")')
+                        if await btn.count() == 0:
+                            btn = page.locator('button:has(iconpark-icon[name="director-mode"])').filter(has_text=re.compile(r'^\s*Enhance Voice\s*$'))
+                        if await btn.count() > 0:
+                            await btn.first.click(timeout=3000)
+                            await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                try:
+                    current_text = await span_locator.first.inner_text(timeout=1500)
+                    if current_text.strip() != text.strip():
+                        for _ in range(2):
+                            await span_locator.first.click()
+                            await asyncio.sleep(0.1)
+                            await page.keyboard.press('Meta+A')
+                            await asyncio.sleep(0.05)
+                            await page.keyboard.press('Backspace')
+                            await asyncio.sleep(0.05)
+                            await page.keyboard.insert_text(text)
+                            await asyncio.sleep(0.1)
+                            await page.keyboard.press('Tab')
+                            await asyncio.sleep(0.2)
+                            current_text = await span_locator.first.inner_text()
+                            if current_text.strip() == text.strip():
+                                break
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     pass
 
-            await asyncio.sleep(random.uniform(0.1, 0.2))
-            try:
-                s_over = (self.config.get('step_overrides') or {}).get('fill_scene') or {}
-                check = s_over.get('check')
-                if bool(check):
-                    cur = await span_locator.first.inner_text()
-                    if self.normalize_text_for_compare(cur) != self.normalize_text_for_compare(text):
-                        self._emit_notice(f"❌ scene_check_failed: scene={scene_number}")
-                        self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
-                        return False
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+                if self.config.get('enable_enhance_voice'):
+                    try:
+                        enhance_buttons = page.locator('button:has(iconpark-icon[name="director-mode"])').filter(has_text=re.compile(r'Enhance Voice|Усилить голос'))
+                        button_count = await enhance_buttons.count()
+                        if button_count > 0:
+                            await enhance_buttons.last.click()
+                            await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(random.uniform(0.1, 0.2))
+                try:
+                    s_over = (self.config.get('step_overrides') or {}).get('fill_scene') or {}
+                    check = s_over.get('check')
+                    if bool(check):
+                        cur = await span_locator.first.inner_text()
+                        if self.normalize_text_for_compare(cur) != self.normalize_text_for_compare(text):
+                            return False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                return True
+
+            step_name_insert = f"insert_text_{scene_number}" if not safe_speaker else f"insert_text_{scene_number}_{safe_speaker}"
+            ok_insert = await self.perform_step(step_name_insert, _insert_text, critical=True)
+            if not ok_insert:
+                self._emit_notice(f"❌ scene_check_failed: scene={scene_number}")
+                self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                return False
+            if self.verify_scene_after_insert:
+                async def _verify():
+                    return await self._verify_scene_text(page, span_locator.first, text)
+                step_name_verify = f"verify_scene_{scene_number}" if not safe_speaker else f"verify_scene_{scene_number}_{safe_speaker}"
+                ok_verify = await self.perform_step(step_name_verify, _verify, critical=True)
+                if not ok_verify:
+                    self._emit_notice(f"❌ scene_verify_failed: scene={scene_number}")
+                    self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                    return False
             self._emit_notice(f"✅ scene_done: scene={scene_number}")
             self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": True})
             return True
@@ -950,6 +1308,168 @@ class HeyGenAutomation:
             print(f"  ❌ Ошибка при заполнении финального окна: {e}")
             return False
     
+    @step("open_browser")
+    async def open_browser(self) -> bool:
+        """
+        Открыть браузер и сохранить его в self.browser и self.playwright.
+        
+        Returns:
+            True если браузер успешно открыт
+        """
+        if self.browser is not None:
+            return True
+        
+        try:
+            p = await async_playwright().start()
+            self.playwright = p
+            
+            print("\n🌐 Подключаюсь к браузеру через CDP...")
+            browser_mode = (self.config.get('browser') or 'chrome').lower()
+            chrome_cdp_url = self.config.get('chrome_cdp_url') or 'http://localhost:9222'
+            multilogin_cdp_url = self.config.get('multilogin_cdp_url')
+            profiles = self.config.get('profiles') or {}
+            profile_to_use = (self.config.get('profile_to_use') or '').strip()
+            force_embedded = bool(self.config.get('force_embedded_browser', False))
+            self._debug_keep_open = bool(self.config.get('debug_keep_browser_open_on_error', False))
+
+            if profile_to_use.lower() == 'ask' or not profile_to_use:
+                if 'chrome_automation' in profiles:
+                    profile_to_use = 'chrome_automation'
+                elif profiles:
+                    profile_to_use = list(profiles.keys())[0]
+                else:
+                    profile_to_use = 'chrome_automation'
+                print(f"⚠️ Профиль был 'ask' или пуст, переключился на: {profile_to_use}")
+
+            if not force_embedded and browser_mode == 'multilogin':
+                if not multilogin_cdp_url:
+                    print("❌ Не задан 'multilogin_cdp_url' в config.json")
+                    raise RuntimeError("multilogin_cdp_url missing")
+                browser = await p.chromium.connect_over_cdp(multilogin_cdp_url)
+                print("✅ Подключился к Multilogin по CDP!")
+            elif not force_embedded:
+                chosen_cdp = chrome_cdp_url
+                profile_path = str(self.config.get('chrome_profile_path', '~/chrome_automation'))
+
+                if profiles and profile_to_use and profile_to_use in profiles:
+                    pconf = profiles[profile_to_use] or {}
+                    if pconf.get('cdp_url'):
+                        chosen_cdp = pconf['cdp_url']
+                    if pconf.get('profile_path'):
+                        profile_path = pconf['profile_path']
+                    print(f"✅ Выбран профиль Chrome: {profile_to_use} ({chosen_cdp})")
+
+                abs_profile_path = os.path.abspath(os.path.expanduser(profile_path))
+                os.makedirs(abs_profile_path, exist_ok=True)
+                
+                # Cleanup SingletonLock to avoid crashes if previous session died
+                lock_file = os.path.join(abs_profile_path, "SingletonLock")
+                if os.path.exists(lock_file):
+                    try:
+                        os.remove(lock_file)
+                        print(f"🧹 Removed stale SingletonLock: {lock_file}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to remove SingletonLock: {e}")
+
+                print("🚀 Запускаю Chrome с постоянным профилем...")
+                
+                # Определяем путь к Chrome в зависимости от ОС
+                chrome_path = ""
+                if sys.platform == "darwin": # macOS
+                    chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                elif sys.platform == "win32": # Windows
+                    chrome_path = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+                
+                # Проверяем тип браузера в профиле
+                pconf = profiles.get(profile_to_use, {})
+                browser_type = pconf.get('browser_type', 'chrome') # default to chrome if not specified
+
+                launch_kwargs = {
+                    "user_data_dir": abs_profile_path,
+                    "headless": False,
+                    "args": ["--disable-blink-features=AutomationControlled"]
+                }
+
+                if browser_type == 'chromium':
+                    print(f"ℹ️ Профиль {profile_to_use} использует Chromium (bundled)")
+                    # Не добавляем executable_path, Playwright использует свой
+                else:
+                    # Для 'chrome' пытаемся найти системный
+                    if os.path.exists(chrome_path):
+                        print(f"🚀 Found System Chrome: {chrome_path}")
+                        launch_kwargs["executable_path"] = chrome_path
+                    else:
+                        print(f"⚠️ System Chrome not found at {chrome_path}. Trying 'channel=chrome'...")
+                        launch_kwargs["channel"] = "chrome"
+
+                try:
+                    browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                    print(f"✅ Браузер запущен с профилем: {profile_to_use}")
+                except Exception as e:
+                    print(f"❌ Ошибка запуска браузера: {e}")
+                    print("⚠️ Пробую fallback на bundled Chromium...")
+                    # Fallback: remove executable_path/channel and try again
+                    launch_kwargs.pop("executable_path", None)
+                    launch_kwargs.pop("channel", None)
+                    browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                    print(f"✅ Fallback: Chromium запущен с профилем: {profile_to_use}")
+            else:
+                auth_state_path = "debug/auth_state.json"
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--ignore-certificate-errors",
+                    "--ignore-ssl-errors",
+                    "--allow-insecure-localhost",
+                    "--disable-web-security"
+                ]
+                browser = await p.chromium.launch(
+                    headless=False,
+                    args=launch_args
+                )
+                print("✅ Запущен встроенный Chromium (force_embedded_browser)!")
+
+            contexts = browser.contexts
+            if not contexts:
+                auth_state_path = "debug/auth_state.json"
+                context_options = {
+                    "viewport": {"width": 1280, "height": 800},
+                    "ignore_https_errors": True
+                }
+
+                if os.path.exists(auth_state_path):
+                    print(f"📂 Загружаю состояние авторизации из {auth_state_path}")
+                    context_options["storage_state"] = auth_state_path
+                else:
+                    print("⚠️ Файл авторизации не найден, запускаю чистую сессию")
+
+                context = await browser.new_context(**context_options)
+
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                """)
+            else:
+                context = contexts[0]
+
+            if not context.pages:
+                page = await context.new_page()
+            else:
+                page = context.pages[0]
+
+            try:
+                page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
+            except Exception:
+                pass
+            
+            self.browser = browser
+            self._page = page
+            return True
+        except Exception as e:
+            logger.error(f"[open_browser] failed: {e}")
+            return False
+
     async def process_episode_part(self, episode_id: str, part_idx: int):
         """
         Обработать одну часть эпизода
@@ -964,111 +1484,200 @@ class HeyGenAutomation:
         template_url, scenes = self.get_episode_data(episode_id, part_idx)
         
         if template_url is None or (isinstance(template_url, str) and template_url.strip() == "") or not scenes:
-            print(f"❌ Нет данных для обработки")
+            try:
+                self.task_status = TaskStatus(task_id=f"{episode_id}:{part_idx}")
+                self.task_status.global_status = "failed"
+            except Exception:
+                pass
+            try:
+                self._last_error = "no_data_for_processing"
+            except Exception:
+                pass
+            try:
+                logger.error("[process_episode_part] failed: no data for processing")
+            except Exception:
+                pass
             return False
         
-        p = None
+        # Инициализация TaskStatus и метрик
         try:
-            p = await async_playwright().start()
-            print("\n🌐 Подключаюсь к браузеру через CDP...")
-            browser_mode = (self.config.get('browser') or 'chrome').lower()
-            chrome_cdp_url = self.config.get('chrome_cdp_url') or 'http://localhost:9222'
-            multilogin_cdp_url = self.config.get('multilogin_cdp_url')
-            profiles = self.config.get('profiles') or {}
-            profile_to_use = (self.config.get('profile_to_use') or '').strip()
+            total_scenes = len(scenes or [])
+            total_brolls = sum(1 for s in (scenes or []) if str(s.get("brolls", "")).strip())
+        except Exception:
+            total_scenes = 0
+            total_brolls = 0
+        self.task_status = TaskStatus(
+            task_id=f"{episode_id}:{part_idx}",
+            metrics=Metrics(scenes_total=total_scenes, brolls_total=total_brolls),
+        )
+        if self.task_status:
+            self.task_status.global_status = "running"
 
-            try:
-                if browser_mode == 'multilogin':
+        p = None
+        page = None
+        try:
+            async def _init_session():
+                nonlocal p, page
+                # Используем существующий браузер, если он есть
+                if self.browser is not None and self.playwright is not None:
+                    p = self.playwright
+                    browser = self.browser
+                    contexts = browser.contexts
+                    if not contexts:
+                        auth_state_path = "debug/auth_state.json"
+                        context_options = {
+                            "viewport": {"width": 1280, "height": 800},
+                            "ignore_https_errors": True
+                        }
+                        if os.path.exists(auth_state_path):
+                            context_options["storage_state"] = auth_state_path
+                        context = await browser.new_context(**context_options)
+                        await context.add_init_script("""
+                            Object.defineProperty(navigator, 'webdriver', {
+                                get: () => undefined
+                            });
+                        """)
+                    else:
+                        context = contexts[0]
+                    if not context.pages:
+                        page = await context.new_page()
+                    else:
+                        page = context.pages[0]
+                    try:
+                        page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
+                    except Exception:
+                        pass
+                    self._page = page
+                    return True
+                
+                p = await async_playwright().start()
+                print("\n🌐 Подключаюсь к браузеру через CDP...")
+                browser_mode = (self.config.get('browser') or 'chrome').lower()
+                chrome_cdp_url = self.config.get('chrome_cdp_url') or 'http://localhost:9222'
+                multilogin_cdp_url = self.config.get('multilogin_cdp_url')
+                profiles = self.config.get('profiles') or {}
+                profile_to_use = (self.config.get('profile_to_use') or '').strip()
+                force_embedded = bool(self.config.get('force_embedded_browser', False))
+                self._debug_keep_open = bool(self.config.get('debug_keep_browser_open_on_error', False))
+
+                if profile_to_use.lower() == 'ask' or not profile_to_use:
+                    if 'chrome_automation' in profiles:
+                        profile_to_use = 'chrome_automation'
+                    elif profiles:
+                        profile_to_use = list(profiles.keys())[0]
+                    else:
+                        profile_to_use = 'chrome_automation'
+                    print(f"⚠️ Профиль был 'ask' или пуст, переключился на: {profile_to_use}")
+
+                if not force_embedded and browser_mode == 'multilogin':
                     if not multilogin_cdp_url:
                         print("❌ Не задан 'multilogin_cdp_url' в config.json")
-                        return False
+                        raise RuntimeError("multilogin_cdp_url missing")
                     browser = await p.chromium.connect_over_cdp(multilogin_cdp_url)
                     print("✅ Подключился к Multilogin по CDP!")
-                else:
+                elif not force_embedded:
                     chosen_cdp = chrome_cdp_url
                     profile_path = str(self.config.get('chrome_profile_path', '~/chrome_automation'))
+
                     if profiles and profile_to_use and profile_to_use in profiles:
                         pconf = profiles[profile_to_use] or {}
                         if pconf.get('cdp_url'):
                             chosen_cdp = pconf['cdp_url']
-                            print(f"✅ Выбран профиль Chrome: {profile_to_use}")
                         if pconf.get('profile_path'):
                             profile_path = pconf['profile_path']
-                    elif profiles and profile_to_use and profile_to_use not in profiles:
-                        print(f"⚠️ Профиль '{profile_to_use}' не найден в config['profiles'], использую {chrome_cdp_url}")
+                        print(f"✅ Выбран профиль Chrome: {profile_to_use} ({chosen_cdp})")
+
+                    abs_profile_path = os.path.expanduser(profile_path)
+                    os.makedirs(abs_profile_path, exist_ok=True)
+
                     try:
+                        print(f"🔄 Попытка подключения к {chosen_cdp}...")
                         browser = await p.chromium.connect_over_cdp(chosen_cdp)
+                        print("✅ Подключился к Chrome через CDP!")
                     except Exception:
-                        port = 9222
-                        m = re.match(r'.*:(\d+)$', chosen_cdp)
-                        if m:
-                            try:
-                                port = int(m.group(1))
-                            except Exception:
-                                port = 9222
-                        chrome_bin = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-                        subprocess.Popen([chrome_bin, f'--remote-debugging-port={port}', f'--user-data-dir={os.path.expanduser(profile_path)}'])
-                        await asyncio.sleep(3)
-                        browser = await p.chromium.connect_over_cdp(chosen_cdp)
-                    print("✅ Подключился к Chrome!")
+                        print(f"⚠️ Не удалось подключиться к {chosen_cdp}.")
+                        print("🚀 Запускаю встроенный Chromium с сохраненным состоянием...")
+
+                        auth_state_path = "debug/auth_state.json"
+                        launch_args = [
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--ignore-certificate-errors",
+                            "--ignore-ssl-errors",
+                            "--allow-insecure-localhost",
+                            "--disable-web-security"
+                        ]
+
+                        browser = await p.chromium.launch(
+                            headless=False,
+                            args=launch_args
+                        )
+                        print("✅ Запущен встроенный Chromium!")
+                else:
+                    auth_state_path = "debug/auth_state.json"
+                    launch_args = [
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--ignore-certificate-errors",
+                        "--ignore-ssl-errors",
+                        "--allow-insecure-localhost",
+                        "--disable-web-security"
+                    ]
+                    browser = await p.chromium.launch(
+                        headless=False,
+                        args=launch_args
+                    )
+                    print("✅ Запущен встроенный Chromium (force_embedded_browser)!")
 
                 contexts = browser.contexts
                 if not contexts:
-                    print("❌ Нет открытых окон в целевом браузере")
-                    return False
-                context = contexts[0]
-                page = await context.new_page()
+                    auth_state_path = "debug/auth_state.json"
+                    context_options = {
+                        "viewport": {"width": 1280, "height": 800},
+                        "ignore_https_errors": True
+                    }
+
+                    if os.path.exists(auth_state_path):
+                        print(f"📂 Загружаю состояние авторизации из {auth_state_path}")
+                        context_options["storage_state"] = auth_state_path
+                    else:
+                        print("⚠️ Файл авторизации не найден, запускаю чистую сессию")
+
+                    context = await browser.new_context(**context_options)
+
+                    await context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                    """)
+                else:
+                    context = contexts[0]
+
+                if not context.pages:
+                    page = await context.new_page()
+                else:
+                    page = context.pages[0]
+
                 try:
                     page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
                 except Exception:
                     pass
-            except Exception as e:
-                print(f"❌ Не могу подключиться к браузеру: {e}")
-                if browser_mode == 'chrome':
-                    port = 9222
-                    profile_path = str(self.config.get('chrome_profile_path', '~/chrome_automation'))
-                    url = chrome_cdp_url
-                    if profiles and profile_to_use and profile_to_use in profiles:
-                        url = (profiles[profile_to_use] or {}).get('cdp_url', url)
-                        profile_path = (profiles[profile_to_use] or {}).get('profile_path', profile_path)
-                    m = re.match(r'.*:(\d+)$', url)
-                    if m:
-                        try:
-                            port = int(m.group(1))
-                        except Exception:
-                            port = 9222
-                    chrome_bin = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-                    try:
-                        subprocess.Popen([chrome_bin, f'--remote-debugging-port={port}', f'--user-data-dir={os.path.expanduser(profile_path)}'])
-                        await asyncio.sleep(3)
-                        browser = await p.chromium.connect_over_cdp(url)
-                        contexts = browser.contexts
-                        if not contexts:
-                            print("❌ Нет открытых окон в целевом браузере")
-                            return False
-                        context = contexts[0]
-                        page = await context.new_page()
-                        print("✅ Профиль Chrome запущен и подключение выполнено")
-                    except Exception:
-                        print("\n💡 Не удалось автоматически запустить Chrome, проверь команду запуска:")
-                        print(f"   /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port={port} --user-data-dir={profile_path}")
-                        return False
-                else:
-                    print("\n💡 Проверь, что профиль Multilogin запущен и CDP URL корректен")
-                    return False
+                self._page = page
+                return True
+
+            await self.perform_step("authorize_session", _init_session, critical=True)
 
             wf_steps = self.config.get("workflow_steps") or []
             if isinstance(wf_steps, list) and len(wf_steps) > 0:
                 ok = await self._run_workflow(page, template_url, scenes, episode_id, part_idx, wf_steps)
-                try:
-                    await page.close()
-                except Exception:
-                    pass
                 return bool(ok)
             
             # Переходим на страницу шаблона
             print(f"📄 Открываю шаблон: {template_url}")
-            await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
+            async def _open_template():
+                await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
+                return True
+            await self.perform_step("open_template", _open_template, critical=True)
             
             # Ждем загрузки страницы и появления первого поля text_1
             print("⏳ Жду загрузки страницы и элементов...")
@@ -1083,6 +1692,15 @@ class HeyGenAutomation:
             
             # Дополнительная пауза для стабильности
             await asyncio.sleep(self.pre_fill_wait)
+
+            part_title = ""
+            try:
+                part_title = str((scenes[0] or {}).get("title") or "")
+            except Exception:
+                part_title = ""
+            async def _set_title():
+                return await self._apply_part_title(page, part_title)
+            await self.perform_step("set_part_title", _set_title, critical=False)
             
             # Заполняем сцены
             self.report = {
@@ -1097,18 +1715,31 @@ class HeyGenAutomation:
             
             for idx, scene in enumerate(scenes, 1):
                 await self._await_gate()
-                success = await self.fill_scene(
-                    page, 
-                    scene['scene_idx'], 
-                    scene['text']
-                )
+                async def _fill_one():
+                    return await self.fill_scene(page, scene['scene_idx'], scene['text'], scene.get('speaker'))
+                safe_sp = self._normalize_speaker_key(scene.get('speaker'))
+                step_name = f"fill_scene_{scene['scene_idx']}" if not safe_sp else f"fill_scene_{scene['scene_idx']}_{safe_sp}"
+                success = await self.perform_step(step_name, _fill_one, critical=True)
                 if success:
                     success_count += 1
+                    try:
+                        if self.task_status:
+                            self.task_status.metrics.scenes_completed += 1
+                    except Exception:
+                        pass
                     # Обработка B-rolls, если заданы в CSV
                     if str(scene.get('brolls', '')).strip():
                         try:
                             await self._await_gate()
-                            await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
+                            async def _broll_one():
+                                return await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
+                            ok_b = await self.perform_step(f"handle_broll_{scene['scene_idx']}", _broll_one, critical=False)
+                            if ok_b:
+                                try:
+                                    if self.task_status:
+                                        self.task_status.metrics.brolls_inserted += 1
+                                except Exception:
+                                    pass
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
@@ -1122,83 +1753,54 @@ class HeyGenAutomation:
             
             print(f"\n📊 Заполнено сцен: {success_count}/{len(scenes)}")
 
-            # Первая проверка: сохранить → перезагрузить → валидировать
-            validation = await self.refresh_and_validate(page, scenes, interactive=False)
-            if not validation.get('ok', True):
-                print("⚠️ Проверка после обновления страницы обнаружила несоответствия")
-
-            # Удаляем пустые сцены перед вторым циклом
-            await self.delete_empty_scenes(page, len(scenes), max_scenes=self.max_scenes)
-
-            # Вторая проверка: сохранить → перезагрузить → валидировать
-            print("🔁 Выполняю вторую проверку после внесённых исправлений...")
-            try:
-                await self.click_save_and_wait(page)
-                await page.reload(wait_until='domcontentloaded', timeout=self.reload_timeout_ms)
-                await asyncio.sleep(self.pre_fill_wait)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            validation2 = await self.refresh_and_validate(page, scenes, interactive=True)
-            if not validation2.get('ok', True):
-                print("\n🚨 ВНИМАНИЕ: НЕСООТВЕТСТВИЯ ПОСЛЕ ВТОРОЙ ПРОВЕРКИ")
-                await self.notify('HeyGen', 'Несоответствия после второй проверки — требуется вмешательство')
-                await self.bring_terminal_to_front()
-                print("============================================================")
-                print("Исправь несоответствия на странице HeyGen и нажми Enter здесь")
-                print("Ожидаю без таймаута — продолжу после Enter")
-                print("============================================================")
-                fut = asyncio.to_thread(input, "")
-                await fut
-                # Финальная попытка проверки
-                validation3 = await self.refresh_and_validate(page, scenes)
-                if not validation3.get('ok', True):
-                    print("⚠️ Продолжаю несмотря на оставшиеся несоответствия по настройке abort_on_validation_failure=false")
-            # Дополнительное удаление пустых сцен после второй проверки
-            await self.delete_empty_scenes(page, len(scenes), max_scenes=self.max_scenes)
-            
-            # Подтверждение перед генерацией (с таймаутом)
-            self.print_final_report()
-            # Блокируем генерацию, если есть несоответствия
-            mismatch_count = len(self.report['validation_missing']) if self.report else 0
-            if mismatch_count > 0:
-                await self.notify('HeyGen', 'Финальная проверка: есть несоответствия — генерация заблокирована')
-                await self.bring_terminal_to_front()
-                print("============================================================")
-                print("Финальный отчёт содержит несоответствия — генерация заблокирована")
-                print("Исправь сцены в HeyGen и нажми Enter здесь")
-                print("============================================================")
-                fut = asyncio.to_thread(input, "")
-                await fut
-                # Повторная проверка после вмешательства и удаление пустых сцен
-                validation4 = await self.refresh_and_validate(page, scenes, interactive=False)
+            final_validation = None
+            for attempt in range(1, 4):
+                try:
+                    if self.report is not None:
+                        self.report['validation_missing'] = []
+                except Exception:
+                    pass
+                final_validation = await self.refresh_and_validate(page, scenes, interactive=False)
+                if not final_validation.get('ok', True):
+                    print(f"⚠️ Несоответствия после проверки {attempt}/3")
                 await self.delete_empty_scenes(page, len(scenes), max_scenes=self.max_scenes)
-                self.print_final_report()
-                mismatch_count = len(self.report['validation_missing']) if self.report else 0
-                if mismatch_count > 0:
-                    print("⚠️ Есть несоответствия даже после вмешательства, продолжаю по настройке abort_on_validation_failure=false")
+                missing = final_validation.get('missing') or []
+                if not missing:
+                    break
+                await asyncio.sleep(self.pre_fill_wait)
+
+            self.print_final_report()
+            final_missing = []
+            try:
+                if final_validation:
+                    final_missing = final_validation.get('missing') or []
+            except Exception:
+                final_missing = []
+            if final_missing:
+                await self.notify('HeyGen', 'Несоответствия после 3 проверок — задача завершена без генерации')
+                if self.task_status:
+                    self.task_status.global_status = "failed"
+                return False
             if self._should_block_generation():
                 reason = self._block_generation_reason()
                 await self.notify('HeyGen', f'Генерация заблокирована: {reason}')
-                await self.bring_terminal_to_front()
                 print("============================================================")
-                print("B-roll не добавлен корректно — генерация заблокирована")
+                print("Генерация заблокирована из-за пропусков/ошибок")
                 if reason:
                     print(f"Причина: {reason}")
-                print("Проверь и исправь сцену в HeyGen вручную и отправь на генерацию сам")
                 print("============================================================")
+                if self.task_status:
+                    self.task_status.global_status = "failed"
                 return False
-            await self._await_gate()
-            proceed = await self.confirm_before_generation()
-            if not proceed:
-                print("⏸️ Генерация приостановлена пользователем")
-                # Ждём повторного подтверждения
-                try:
-                    input("Нажми Enter, чтобы продолжить отправку на генерацию...")
-                except Exception:
-                    pass
-            
+            if not self._generation_enabled():
+                async def _save_only():
+                    await self.click_save_and_wait(page)
+                    return True
+                await self.perform_step("save_before_exit", _save_only, critical=False)
+                print("⏭️ Генерация отключена — проект сохранён")
+                if self.task_status:
+                    self.task_status.global_status = "completed"
+                return True
             # Нажимаем кнопку "Сгенерировать"
             await self.click_generate_button(page)
             
@@ -1208,10 +1810,8 @@ class HeyGenAutomation:
             
             # Вкладка автоматически закроется после обработки
             print(f"\n✅ Часть {part_idx} обработана и отправлена на генерацию!")
-            
-            # Закрываем вкладку
-            await page.close()
-            print(f"🔒 Вкладка закрыта\n")
+            if self.task_status:
+                self.task_status.global_status = "completed"
             
             return True
         except asyncio.CancelledError:
@@ -1221,16 +1821,6 @@ class HeyGenAutomation:
             print(f"❌ Ошибка обработки части эпизода {episode_id} part={part_idx}: {e}")
             return False
         finally:
-            try:
-                if 'page' in locals() and page is not None:
-                    await page.close()
-            except Exception:
-                pass
-            try:
-                if p is not None:
-                    await p.stop()
-            except Exception:
-                pass
             self._current_episode_id = None
             self._current_part_idx = None
 
@@ -1290,7 +1880,283 @@ class HeyGenAutomation:
         except Exception:
             return s
 
+    @step("execute_workflow_step")
+    async def _execute_single_step(self, page: Page, raw: dict, ctx: dict, template_url: str, scenes: list, has_broll_step: bool) -> bool:
+        step_type = str(raw.get("type") or "").strip()
+        params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+        try:
+            if step_type in ("navigate_to_template", "navigate"):
+                url = self._wf_render(params.get("url") or template_url, ctx).strip()
+                wait_until = self._wf_render(params.get("wait_until") or "domcontentloaded", ctx).strip() or "domcontentloaded"
+                timeout = self._wf_int(params.get("timeout_ms"), 120000)
+                print(f"📄 Открываю: {url}")
+                await page.goto(url, wait_until=wait_until, timeout=timeout)
+                return True
+
+            if step_type in ("wait_for", "wait_for_selector"):
+                sel = self._wf_render(params.get("selector") or "", ctx).strip()
+                if not sel:
+                    return True
+                timeout = self._wf_int(params.get("timeout_ms"), 30000)
+                state = self._wf_render(params.get("state") or "visible", ctx).strip() or "visible"
+                await page.wait_for_selector(sel, timeout=timeout, state=state)
+                return True
+
+            if step_type in ("wait", "sleep"):
+                sec = self._wf_float(params.get("sec"), self.pre_fill_wait)
+                await asyncio.sleep(sec)
+                return True
+
+            if step_type == "click":
+                sel = self._wf_render(params.get("selector") or "", ctx).strip()
+                if not sel:
+                    return True
+                timeout = self._wf_int(params.get("timeout_ms"), None)
+                loc = page.locator(sel)
+                which = self._wf_render(params.get("which") or "", ctx).strip().lower()
+                if which == "last":
+                    loc = loc.last
+                elif which.isdigit():
+                    loc = loc.nth(int(which))
+                if timeout is None:
+                    await loc.click()
+                else:
+                    await loc.click(timeout=timeout)
+                return True
+
+            if step_type == "fill":
+                sel = self._wf_render(params.get("selector") or "", ctx).strip()
+                text = self._wf_render(params.get("text") or "", ctx).replace("\\n", "\n")
+                if not sel:
+                    return True
+                await page.locator(sel).fill(text)
+                return True
+
+            if step_type == "press":
+                sel = self._wf_render(params.get("selector") or "", ctx).strip()
+                key = self._wf_render(params.get("key") or "", ctx).strip()
+                if not sel or not key:
+                    return True
+                await page.press(sel, key)
+                return True
+
+            if step_type in ("select_episode_parts", "select_parts_by_episode"):
+                episode = self._wf_render(
+                    params.get("episode")
+                    or params.get("episode_name")
+                    or params.get("episode_title")
+                    or ctx.get("episode_id")
+                    or "",
+                    ctx,
+                ).strip()
+                title_selector = self._wf_render(params.get("title_selector") or "", ctx).strip()
+                checkbox_selector = self._wf_render(params.get("checkbox_selector") or "", ctx).strip()
+                button_selector = self._wf_render(
+                    params.get("button_selector") or params.get("after_button_selector") or "", ctx
+                ).strip()
+                timeout = self._wf_int(params.get("timeout_ms"), 60000)
+                hover_sec = self._wf_float(params.get("hover_sec"), 0.15)
+                card_xpath = str(params.get("card_xpath") or "xpath=ancestor::div[1]").strip()
+
+                if not episode or not title_selector or not checkbox_selector:
+                    return True
+
+                await page.wait_for_selector(title_selector, timeout=timeout)
+                titles = page.locator(title_selector).filter(has_text=episode)
+                cnt = await titles.count()
+                if cnt <= 0:
+                    return True
+
+                for i in range(cnt):
+                    tloc = titles.nth(i)
+                    card = tloc
+                    try:
+                        if card_xpath:
+                            card = tloc.locator(card_xpath)
+                    except Exception:
+                        card = tloc
+
+                    try:
+                        await card.hover(timeout=timeout)
+                    except Exception:
+                        pass
+                    if hover_sec and hover_sec > 0:
+                        await asyncio.sleep(hover_sec)
+
+                    cb = None
+                    try:
+                        cb = card.locator(checkbox_selector)
+                        if await cb.count() == 0:
+                            cb = page.locator(checkbox_selector)
+                    except Exception:
+                        cb = page.locator(checkbox_selector)
+
+                    try:
+                        if cb is not None and await cb.count() > 0:
+                            await cb.first.click(timeout=timeout)
+                    except Exception:
+                        try:
+                            if cb is not None and await cb.count() > 0:
+                                await cb.first.click(timeout=timeout, force=True)
+                        except Exception:
+                            pass
+
+                if button_selector:
+                    try:
+                        await page.locator(button_selector).first.click(timeout=timeout)
+                    except Exception:
+                        try:
+                            await page.locator(button_selector).first.click(timeout=timeout, force=True)
+                        except Exception:
+                            pass
+                return True
+
+            if step_type == "fill_scene":
+                inline_broll = None
+                if "handle_broll" in params:
+                    inline_broll = self._wf_bool(params.get("handle_broll"), True)
+                elif not has_broll_step:
+                    inline_broll = True
+                part_title = ""
+                try:
+                    part_title = str((scenes[0] or {}).get("title") or "")
+                except Exception:
+                    part_title = ""
+                async def _set_title():
+                    return await self._apply_part_title(page, part_title)
+                await self.perform_step("set_part_title", _set_title, critical=False)
+                print(f"\\n📝 Начинаю заполнение {len(scenes)} сцен...")
+                success_count = 0
+                for idx, scene in enumerate(scenes, 1):
+                    try:
+                        async def _fill_one():
+                            return await self.fill_scene(page, scene['scene_idx'], scene['text'], scene.get('speaker'))
+                        safe_sp = self._normalize_speaker_key(scene.get('speaker'))
+                        step_name = f"fill_scene_{scene['scene_idx']}" if not safe_sp else f"fill_scene_{scene['scene_idx']}_{safe_sp}"
+                        ok = await self.perform_step(step_name, _fill_one, critical=True)
+                    except Exception as e:
+                        print(f"⚠️ Ошибка заполнения сцены {scene.get('scene_idx')}: {e}")
+                        ok = False
+                    if ok:
+                        success_count += 1
+                        try:
+                            if self.task_status:
+                                self.task_status.metrics.scenes_completed += 1
+                        except Exception:
+                            pass
+                        if inline_broll and str(scene.get('brolls', '')).strip():
+                            try:
+                                async def _broll_one():
+                                    return await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
+                                ok_b = await self.perform_step(f"handle_broll_{scene['scene_idx']}", _broll_one, critical=False)
+                                if ok_b:
+                                    try:
+                                        if self.task_status:
+                                            self.task_status.metrics.brolls_inserted += 1
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                print(f"⚠️ Ошибка обработки brolls для сцены {scene.get('scene_idx')}: {e}")
+                                if self.report is not None:
+                                    self.report['broll_errors'].append({'scene_idx': scene.get('scene_idx'), 'error': str(e)})
+                    if idx < len(scenes):
+                        await asyncio.sleep(self.delay_between_scenes)
+                print(f"\\n📊 Заполнено сцен: {success_count}/{len(scenes)}")
+                return True
+
+            if step_type == "handle_broll":
+                for scene in scenes:
+                    if str(scene.get('brolls', '')).strip():
+                        try:
+                            async def _broll_one():
+                                return await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
+                            ok_b = await self.perform_step(f"handle_broll_{scene['scene_idx']}", _broll_one, critical=False)
+                            if ok_b:
+                                try:
+                                    if self.task_status:
+                                        self.task_status.metrics.brolls_inserted += 1
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            print(f"⚠️ Ошибка обработки brolls для сцены {scene.get('scene_idx')}: {e}")
+                            if self.report is not None:
+                                self.report['broll_errors'].append({'scene_idx': scene.get('scene_idx'), 'error': str(e)})
+                return True
+
+            if step_type == "delete_empty_scenes":
+                max_scenes = self._wf_int(params.get("max_scenes"), self.max_scenes)
+                await self.delete_empty_scenes(page, len(scenes), max_scenes=max_scenes)
+                return True
+
+            if step_type == "save":
+                await self.click_save_and_wait(page)
+                return True
+
+            if step_type == "reload":
+                wait_until = str(params.get("wait_until") or "domcontentloaded").strip() or "domcontentloaded"
+                timeout = self._wf_int(params.get("timeout_ms"), self.reload_timeout_ms)
+                await page.reload(wait_until=wait_until, timeout=timeout)
+                sec = self._wf_float(params.get("post_wait_sec"), self.pre_fill_wait)
+                if sec > 0:
+                    await asyncio.sleep(sec)
+                return True
+
+            if step_type == "reload_and_validate":
+                interactive = self._wf_bool(params.get("interactive"), False)
+                validation = await self.refresh_and_validate(page, scenes, interactive=interactive)
+                if not validation.get('ok', True):
+                    print("⚠️ Проверка обнаружила несоответствия")
+                return True
+
+            if step_type == "confirm":
+                if not self._generation_enabled():
+                    return True
+                return True
+
+            if step_type == "generate":
+                if not self._generation_enabled():
+                    return True
+                if self._should_block_generation():
+                    reason = self._block_generation_reason()
+                    await self.notify('HeyGen', f'Генерация заблокирована: {reason}')
+                    print("============================================================")
+                    print("Генерация заблокирована из-за пропусков/ошибок")
+                    if reason:
+                        print(f"Причина: {reason}")
+                    print("============================================================")
+                    if self.task_status:
+                        self.task_status.global_status = "failed"
+                    return False
+                await self.click_generate_button(page)
+                return True
+
+            if step_type == "final_submit":
+                if not self._generation_enabled():
+                    return True
+                if self._should_block_generation():
+                    reason = self._block_generation_reason()
+                    await self.notify('HeyGen', f'Генерация заблокирована: {reason}')
+                    print("============================================================")
+                    print("Генерация заблокирована из-за пропусков/ошибок")
+                    if reason:
+                        print(f"Причина: {reason}")
+                    print("============================================================")
+                    if self.task_status:
+                        self.task_status.global_status = "failed"
+                    return False
+                await self.fill_and_submit_final_window(page, title)
+                return True
+
+            if step_type:
+                print(f"⚠️ Неизвестный шаг воркфлоу: {step_type}")
+            return True
+        except Exception as e:
+            print(f"❌ Ошибка шага воркфлоу: type={step_type} err={e}")
+            return False
+
+    @step("run_workflow")
     async def _run_workflow(self, page: Page, template_url: str, scenes: list, episode_id: str, part_idx: int, steps: list) -> bool:
+        print(f"DEBUG: _run_workflow called with {len(steps)} steps")
         self.report = {
             'validation_missing': [],
             'broll_skipped': [],
@@ -1323,266 +2189,30 @@ class HeyGenAutomation:
             "scenes_count": str(len(scenes or [])),
         }
 
-        for raw in steps:
+        for i, raw in enumerate(steps):
+            print(f"DEBUG: Processing step {i}")
             if not isinstance(raw, dict):
                 continue
             if "enabled" in raw and not self._wf_bool(raw.get("enabled"), True):
                 continue
-            step_type = str(raw.get("type") or "").strip()
-            params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
-            try:
-                if step_type in ("navigate_to_template", "navigate"):
-                    url = self._wf_render(params.get("url") or template_url, ctx).strip()
-                    wait_until = self._wf_render(params.get("wait_until") or "domcontentloaded", ctx).strip() or "domcontentloaded"
-                    timeout = self._wf_int(params.get("timeout_ms"), 120000)
-                    print(f"📄 Открываю: {url}")
-                    await page.goto(url, wait_until=wait_until, timeout=timeout)
-                    continue
-
-                if step_type in ("wait_for", "wait_for_selector"):
-                    sel = self._wf_render(params.get("selector") or "", ctx).strip()
-                    if not sel:
-                        continue
-                    timeout = self._wf_int(params.get("timeout_ms"), 30000)
-                    state = self._wf_render(params.get("state") or "visible", ctx).strip() or "visible"
-                    await page.wait_for_selector(sel, timeout=timeout, state=state)
-                    continue
-
-                if step_type in ("wait", "sleep"):
-                    sec = self._wf_float(params.get("sec"), self.pre_fill_wait)
-                    await asyncio.sleep(sec)
-                    continue
-
-                if step_type == "click":
-                    sel = self._wf_render(params.get("selector") or "", ctx).strip()
-                    if not sel:
-                        continue
-                    timeout = self._wf_int(params.get("timeout_ms"), None)
-                    loc = page.locator(sel)
-                    which = self._wf_render(params.get("which") or "", ctx).strip().lower()
-                    if which == "last":
-                        loc = loc.last
-                    elif which.isdigit():
-                        loc = loc.nth(int(which))
-                    if timeout is None:
-                        await loc.click()
-                    else:
-                        await loc.click(timeout=timeout)
-                    continue
-
-                if step_type == "fill":
-                    sel = self._wf_render(params.get("selector") or "", ctx).strip()
-                    text = self._wf_render(params.get("text") or "", ctx).replace("\\n", "\n")
-                    if not sel:
-                        continue
-                    await page.locator(sel).fill(text)
-                    continue
-
-                if step_type == "press":
-                    sel = self._wf_render(params.get("selector") or "", ctx).strip()
-                    key = self._wf_render(params.get("key") or "", ctx).strip()
-                    if not sel or not key:
-                        continue
-                    await page.press(sel, key)
-                    continue
-
-                if step_type in ("select_episode_parts", "select_parts_by_episode"):
-                    episode = self._wf_render(
-                        params.get("episode")
-                        or params.get("episode_name")
-                        or params.get("episode_title")
-                        or ctx.get("episode_id")
-                        or "",
-                        ctx,
-                    ).strip()
-                    title_selector = self._wf_render(params.get("title_selector") or "", ctx).strip()
-                    checkbox_selector = self._wf_render(params.get("checkbox_selector") or "", ctx).strip()
-                    button_selector = self._wf_render(
-                        params.get("button_selector") or params.get("after_button_selector") or "", ctx
-                    ).strip()
-                    timeout = self._wf_int(params.get("timeout_ms"), 60000)
-                    hover_sec = self._wf_float(params.get("hover_sec"), 0.15)
-                    card_xpath = str(params.get("card_xpath") or 'xpath=ancestor::div[contains(@class,"tw-relative")][1]').strip()
-
-                    if not episode or not title_selector or not checkbox_selector:
-                        continue
-
-                    await page.wait_for_selector(title_selector, timeout=timeout)
-                    titles = page.locator(title_selector).filter(has_text=episode)
-                    cnt = await titles.count()
-                    if cnt <= 0:
-                        continue
-
-                    for i in range(cnt):
-                        tloc = titles.nth(i)
-                        card = tloc
-                        try:
-                            if card_xpath:
-                                card = tloc.locator(card_xpath)
-                        except Exception:
-                            card = tloc
-
-                        try:
-                            await card.hover(timeout=timeout)
-                        except Exception:
-                            pass
-                        if hover_sec and hover_sec > 0:
-                            await asyncio.sleep(hover_sec)
-
-                        cb = None
-                        try:
-                            cb = card.locator(checkbox_selector)
-                            if await cb.count() == 0:
-                                cb = page.locator(checkbox_selector)
-                        except Exception:
-                            cb = page.locator(checkbox_selector)
-
-                        try:
-                            if cb is not None and await cb.count() > 0:
-                                await cb.first.click(timeout=timeout)
-                        except Exception:
-                            try:
-                                if cb is not None and await cb.count() > 0:
-                                    await cb.first.click(timeout=timeout, force=True)
-                            except Exception:
-                                pass
-
-                    if button_selector:
-                        try:
-                            await page.locator(button_selector).first.click(timeout=timeout)
-                        except Exception:
-                            try:
-                                await page.locator(button_selector).first.click(timeout=timeout, force=True)
-                            except Exception:
-                                pass
-                    continue
-
-                if step_type == "fill_scene":
-                    inline_broll = None
-                    if "handle_broll" in params:
-                        inline_broll = self._wf_bool(params.get("handle_broll"), True)
-                    elif not has_broll_step:
-                        inline_broll = True
-                    print(f"\n📝 Начинаю заполнение {len(scenes)} сцен...")
-                    success_count = 0
-                    for idx, scene in enumerate(scenes, 1):
-                        try:
-                            ok = await self.fill_scene(page, scene['scene_idx'], scene['text'])
-                        except Exception as e:
-                            print(f"⚠️ Ошибка заполнения сцены {scene.get('scene_idx')}: {e}")
-                            ok = False
-                        if ok:
-                            success_count += 1
-                            if inline_broll and str(scene.get('brolls', '')).strip():
-                                try:
-                                    await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
-                                except Exception as e:
-                                    print(f"⚠️ Ошибка обработки brolls для сцены {scene.get('scene_idx')}: {e}")
-                                    if self.report is not None:
-                                        self.report['broll_errors'].append({'scene_idx': scene.get('scene_idx'), 'error': str(e)})
-                        if idx < len(scenes):
-                            await asyncio.sleep(self.delay_between_scenes)
-                    print(f"\n📊 Заполнено сцен: {success_count}/{len(scenes)}")
-                    continue
-
-                if step_type == "handle_broll":
-                    for scene in scenes:
-                        if str(scene.get('brolls', '')).strip():
-                            try:
-                                await self.handle_broll_for_scene(page, scene['scene_idx'], str(scene['brolls']).strip())
-                            except Exception as e:
-                                print(f"⚠️ Ошибка обработки brolls для сцены {scene.get('scene_idx')}: {e}")
-                                if self.report is not None:
-                                    self.report['broll_errors'].append({'scene_idx': scene.get('scene_idx'), 'error': str(e)})
-                    continue
-
-                if step_type == "delete_empty_scenes":
-                    max_scenes = self._wf_int(params.get("max_scenes"), self.max_scenes)
-                    await self.delete_empty_scenes(page, len(scenes), max_scenes=max_scenes)
-                    continue
-
-                if step_type == "save":
-                    await self.click_save_and_wait(page)
-                    continue
-
-                if step_type == "reload":
-                    wait_until = str(params.get("wait_until") or "domcontentloaded").strip() or "domcontentloaded"
-                    timeout = self._wf_int(params.get("timeout_ms"), self.reload_timeout_ms)
-                    await page.reload(wait_until=wait_until, timeout=timeout)
-                    sec = self._wf_float(params.get("post_wait_sec"), self.pre_fill_wait)
-                    if sec > 0:
-                        await asyncio.sleep(sec)
-                    continue
-
-                if step_type == "reload_and_validate":
-                    interactive = self._wf_bool(params.get("interactive"), False)
-                    validation = await self.refresh_and_validate(page, scenes, interactive=interactive)
-                    if not validation.get('ok', True):
-                        print("⚠️ Проверка обнаружила несоответствия")
-                    continue
-
-                if step_type == "confirm":
-                    proceed = await self.confirm_before_generation()
-                    if not proceed:
-                        try:
-                            input("Нажми Enter, чтобы продолжить отправку на генерацию...")
-                        except Exception:
-                            pass
-                    continue
-
-                if step_type == "generate":
-                    if self._should_block_generation():
-                        reason = self._block_generation_reason()
-                        await self.notify('HeyGen', f'Генерация заблокирована: {reason}')
-                        print("============================================================")
-                        print("B-roll не добавлен корректно — генерация заблокирована")
-                        if reason:
-                            print(f"Причина: {reason}")
-                        print("Проверь и исправь сцену в HeyGen вручную и отправь на генерацию сам")
-                        print("============================================================")
-                        return False
-                    await self.click_generate_button(page)
-                    continue
-
-                if step_type == "final_submit":
-                    if self._should_block_generation():
-                        reason = self._block_generation_reason()
-                        await self.notify('HeyGen', f'Генерация заблокирована: {reason}')
-                        print("============================================================")
-                        print("B-roll не добавлен корректно — генерация заблокирована")
-                        if reason:
-                            print(f"Причина: {reason}")
-                        print("Проверь и исправь сцену в HeyGen вручную и отправь на генерацию сам")
-                        print("============================================================")
-                        return False
-                    await self.fill_and_submit_final_window(page, title)
-                    continue
-
-                if step_type:
-                    print(f"⚠️ Неизвестный шаг воркфлоу: {step_type}")
-            except Exception as e:
-                print(f"❌ Ошибка шага воркфлоу: type={step_type} err={e}")
+            ok = await self._execute_single_step(page, raw, ctx, template_url, scenes, has_broll_step)
+            print(f"DEBUG: Step {i} result: {ok}")
+            if not ok:
                 return False
 
-            print(f"\n✅ Часть {part_idx} обработана и отправлена на генерацию!")
+        if not self._generation_enabled():
+            async def _save_only():
+                await self.click_save_and_wait(page)
+                return True
+            await self.perform_step("save_before_exit", _save_only, critical=False)
+            print(f"\n✅ Часть {part_idx} обработана и сохранена без генерации!")
             return True
 
+        print(f"\n✅ Часть {part_idx} обработана и отправлена на генерацию!")
+        return True
+
     async def confirm_before_generation(self) -> bool:
-        print(f"\n============================================================")
-        print(f"❓ Отправка на генерацию через {self.confirm_timeout_sec} сек.")
-        print(f"👉 Нажми Enter СЕЙЧАС, чтобы поставить на паузу.")
-        print(f"============================================================")
-        await self.notify('HeyGen', 'Подтверждение: отправить на генерацию?')
-        await self.bring_terminal_to_front()
-        try:
-            fut = asyncio.to_thread(input, "")
-            await asyncio.wait_for(fut, timeout=self.confirm_timeout_sec)
-            return False
-        except asyncio.TimeoutError:
-            print("▶️ Продолжаю: таймаут подтверждения истёк")
-            return True
-        except Exception:
-            return True
+        return True
 
     async def handle_broll_for_scene(self, page: Page, scene_idx: int, query: str) -> bool:
         self._emit_notice(f"🎞️ broll_start: scene={scene_idx} query={query}")
@@ -1643,120 +2273,21 @@ class HeyGenAutomation:
         await self._broll_pause(0.2)
 
         # Источник (Sources)
-        try:
-            if self.media_source not in ['all', 'все', '']:
-                # Находим кнопку комбобокса по вложенному span с текстом
-                src_span = page.locator('div[data-selected-value="true"] > span').filter(has_text=re.compile(r'^\s*(Источники|Sources)\s*$'))
-                if await src_span.count() > 0:
-                    src_btn = src_span.first.locator('xpath=ancestor::button[1]')
-                    await src_btn.click(timeout=5000)
-                else:
-                    try:
-                        await page.get_by_role('combobox', name='Источники').click(timeout=5000)
-                    except Exception:
-                        try:
-                            await page.get_by_role('combobox', name='Sources').click(timeout=5000)
-                        except Exception:
-                            src_btn = page.locator('button[role="combobox"]').filter(has_text=re.compile(r'^\s*(Источники|Sources)\s*$'))
-                            if await src_btn.count() > 0:
-                                await src_btn.first.click(timeout=5000)
-                await asyncio.sleep(0.1)
-                src_map = {
-                    'all': ['Все', 'All'],
-                    'getty': ['Getty'],
-                    'storyblocks': ['Storyblocks', 'Storyblock'],
-                    'pexels': ['Pexels']
-                }
-                targets = src_map.get(self.media_source, [])
-                picked = False
-                # Попытка через aria-controls портала Radix
-                try:
-                    ctrl_btn = src_span.first.locator('xpath=ancestor::button[1]') if await src_span.count() > 0 else page.locator('button[role="combobox"]').filter(has_text=re.compile(r'^\s*(Источники|Sources)\s*$')).first
-                    ctrl_id = await ctrl_btn.get_attribute('aria-controls')
-                except Exception:
-                    ctrl_id = None
-                if ctrl_id:
-                    esc = ctrl_id.replace(':', '\\:')
-                    for t in targets:
-                        opt = page.locator(f'#{esc}').locator(f'text={t}')
-                        if await opt.count() > 0:
-                            await opt.first.click(timeout=5000)
-                            picked = True
-                            break
-                if not picked:
-                    for t in targets:
-                        opt2 = page.locator('[role="option"]').filter(has_text=re.compile(rf'^\s*{re.escape(t)}\s*$'))
-                        if await opt2.count() > 0:
-                            await opt2.first.click(timeout=5000)
-                            picked = True
-                            break
-                try:
-                    await page.keyboard.press('Escape')
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"⚠️ Не удалось выбрать источник: {e}")
+        async def _gate():
+            await self._await_gate()
+        
+        if self.media_source not in ['all', 'все', '']:
+            self._emit_notice(f"📂 broll_source: {self.media_source}")
+            ok_source = await select_media_source(page, self.media_source, gate_callback=_gate)
+            if not ok_source:
+                self._emit_notice(f"⚠️ не удалось выбрать источник: {self.media_source}")
 
-        # Ориентация → выбор по локали
-        try:
-            await page.get_by_role('combobox', name='Ориентация').click(timeout=5000)
-        except Exception:
-            try:
-                combo = page.locator('button[role="combobox"]').filter(has_text=re.compile(r'Ориентация'))
-                if await combo.count() > 0:
-                    await combo.first.click(timeout=5000)
-                else:
-                    print("⚠️ Комбобокс 'Ориентация' не найден")
-            except Exception as e:
-                print(f"⚠️ Не удалось открыть комбобокс 'Ориентация': {e}")
-        try:
-            await asyncio.sleep(0.1)
-            combo_open = page.locator('button[role="combobox"][data-state="open"]')
-            if await combo_open.count() == 0:
-                await asyncio.sleep(0.1)
-            target_ru = None
-            try:
-                ctrl_id = await page.locator('button[role="combobox"]').filter(has_text=re.compile(r'Ориентация')).first.get_attribute('aria-controls')
-            except Exception:
-                ctrl_id = None
-            if ctrl_id:
-                esc = ctrl_id.replace(':', '\\:')
-                choice = self.orientation_choice or 'Горизонтальная'
-                overlay_ru = page.locator(f'#{esc} >> text={choice}')
-                if await overlay_ru.count() > 0:
-                    target_ru = overlay_ru.first
-            if target_ru:
-                await target_ru.click(timeout=5000)
-            else:
-                opt_ru = page.locator('[role="option"]').filter(has_text=re.compile(rf'^\s*{re.escape(self.orientation_choice or "Горизонтальная")}\s*$'))
-                if await opt_ru.count() > 0:
-                    await opt_ru.first.click(timeout=5000)
-                else:
-                    opt_en = page.locator('[role="option"]').filter(has_text=re.compile(r'^\s*Landscape\s*$'))
-                    if await opt_en.count() > 0:
-                        await opt_en.first.click(timeout=5000)
-                    else:
-                        try:
-                            await page.keyboard.press('ArrowDown')
-                            await asyncio.sleep(0.05)
-                            await page.keyboard.press('ArrowDown')
-                            await asyncio.sleep(0.05)
-                            await page.keyboard.press('Enter')
-                        except Exception:
-                            print("⚠️ Опция ориентации не найдена")
-            try:
-                await page.keyboard.press('Escape')
-            except Exception:
-                pass
-            try:
-                selected = page.locator('button[role="combobox"]').locator('div[data-selected-value="true"] span')
-                val = (await selected.first.inner_text()).strip()
-                if val not in ['Landscape', 'Горизонтальная']:
-                    print(f"⚠️ Ориентация выбрана, но текущее значение: '{val}'")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"⚠️ Не удалось выбрать ориентацию: {e}")
+        # Ориентация (Orientation)
+        choice = self.orientation_choice or 'Горизонтальная'
+        self._emit_notice(f"📐 broll_orientation: {choice}")
+        ok_orient = await select_orientation(page, choice, gate_callback=_gate)
+        if not ok_orient:
+            self._emit_notice(f"⚠️ не удалось выбрать ориентацию: {choice}")
 
         await self._broll_pause(0.2)
 
@@ -1806,9 +2337,11 @@ class HeyGenAutomation:
             return False
 
         # Ожидание результатов до 5 сек или до появления карточек
-        results_selector = 'div.tw-group.tw-relative.tw-overflow-hidden.tw-rounded-md'
         try:
-            await page.wait_for_selector(results_selector, timeout=self.search_results_timeout_ms)
+            await page.wait_for_timeout(300)
+            card = await self._locate_broll_result_card(page)
+            if card is None:
+                raise RuntimeError("result_card_not_found")
         except Exception:
             # Сокращаем запрос по последнему слову до 2 слов
             try:
@@ -1823,9 +2356,11 @@ class HeyGenAutomation:
                     await page.keyboard.insert_text(q2)
                     await page.keyboard.press('Enter')
                     try:
-                        await page.wait_for_selector(results_selector, timeout=self.search_results_timeout_ms)
-                        query = q2
-                        break
+                        await page.wait_for_timeout(300)
+                        card = await self._locate_broll_result_card(page)
+                        if card is not None:
+                            query = q2
+                            break
                     except Exception:
                         continue
                 else:
@@ -1850,7 +2385,9 @@ class HeyGenAutomation:
         # Выбрать первый видео-результат
         try:
             self._emit_notice("🧩 broll_pick_first")
-            first_card = page.locator(results_selector).first
+            first_card = await self._locate_broll_result_card(page)
+            if first_card is None:
+                raise RuntimeError("result_card_not_found")
             try:
                 await first_card.click(timeout=8000, force=True)
             except Exception:
@@ -2002,34 +2539,70 @@ class HeyGenAutomation:
     async def click_save_and_wait(self, page: Page):
         print("\n💾 Сохраняю изменения перед проверкой...")
         await self._await_gate()
+        wait_ms = max(int(self.save_notification_timeout_ms), 40000)
+
+        async def _wait_saved() -> bool:
+            try:
+                notif_ru = page.locator('div').filter(has_text=re.compile(r'^\s*Сохранено\s*$'))
+                if await notif_ru.count() > 0:
+                    loc = notif_ru.nth(2) if await notif_ru.count() > 2 else notif_ru.first
+                    await loc.wait_for(state='visible', timeout=wait_ms)
+                    return True
+            except Exception:
+                pass
+            try:
+                notif_en = page.locator('div').filter(has_text=re.compile(r'^\s*Saved\s*$'))
+                if await notif_en.count() > 0:
+                    loc = notif_en.nth(2) if await notif_en.count() > 2 else notif_en.first
+                    await loc.wait_for(state='visible', timeout=wait_ms)
+                    return True
+            except Exception:
+                pass
+            return False
+
         try:
-            btn = page.locator('button:has(iconpark-icon[name="saved"])')
-            if await btn.count() == 0:
-                ico = page.locator('iconpark-icon[name="saved"]')
-                if await ico.count() > 0:
-                    btn = ico.first.locator('xpath=ancestor::button[1]')
-            if await btn.count() > 0:
+            try:
                 await self._await_gate()
-                await btn.first.scroll_into_view_if_needed()
-                await asyncio.sleep(0.1)
-                await self._await_gate()
-                await btn.first.click(timeout=5000)
-            else:
-                print("⚠️ Кнопка сохранения не найдена — выполняю Cmd+S")
+                await page.keyboard.press('Meta+S')
+            except Exception:
+                pass
+
+            saved = await _wait_saved()
+            if not saved:
                 try:
-                    await self._await_gate()
-                    await page.keyboard.press('Meta+S')
+                    menu_btn = page.get_by_role("button").nth(1)
+                    await menu_btn.click(timeout=5000)
                 except Exception:
                     pass
-            try:
-                notif_ru = page.get_by_text('Сохранено', exact=True)
-                notif_en = page.get_by_text('Saved', exact=True)
                 try:
-                    await notif_ru.wait_for(state='visible', timeout=self.save_notification_timeout_ms)
+                    save_item = page.locator('div').filter(has_text=re.compile(r'^\s*Сохранить\s*$'))
+                    if await save_item.count() > 0:
+                        target = save_item.nth(3) if await save_item.count() > 3 else save_item.first
+                        await target.click(timeout=5000)
                 except Exception:
-                    await notif_en.wait_for(state='visible', timeout=self.save_notification_timeout_ms)
+                    pass
+                saved = await _wait_saved()
+
+            if not saved:
+                try:
+                    btn = page.locator('button:has(iconpark-icon[name="saved"])')
+                    if await btn.count() == 0:
+                        ico = page.locator('iconpark-icon[name="saved"]')
+                        if await ico.count() > 0:
+                            btn = ico.first.locator('xpath=ancestor::button[1]')
+                    if await btn.count() > 0:
+                        await self._await_gate()
+                        await btn.first.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.1)
+                        await self._await_gate()
+                        await btn.first.click(timeout=5000)
+                        await _wait_saved()
+                except Exception:
+                    pass
+
+            if saved:
                 print("✅ Сохранено — уведомление получено")
-            except Exception:
+            else:
                 await self._await_gate()
                 await asyncio.sleep(self.save_fallback_wait_sec)
         except Exception as e:
@@ -2042,6 +2615,22 @@ class HeyGenAutomation:
             subprocess.Popen(['osascript', '-e', 'tell application "Terminal" to activate'])
         except Exception:
             pass
+
+    async def close_browser(self):
+        try:
+            page = getattr(self, "_page", None)
+            if page is not None:
+                try:
+                    browser = page.context.browser
+                    if browser is not None:
+                        await browser.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                self._page = None
+            except Exception:
+                pass
 
     async def refresh_and_validate(self, page: Page, scenes: list, interactive: bool = True):
         # Обновление страницы
@@ -2172,39 +2761,6 @@ class HeyGenAutomation:
                     print(f"❌ Текст отсутствует после автоисправления: scene_idx={scene_idx}")
                     print(f"========================================\n")
                     missing.append(scene_idx)
-                # Интерактивная пауза для ручной проверки
-                do_interact = interactive
-                try:
-                    do_interact = do_interact and bool(self.config.get('interactive_on_mismatch', True))
-                except Exception:
-                    pass
-                if do_interact:
-                    pressed = False
-                    try:
-                        await self._await_gate()
-                        await self.notify('HeyGen', f'Требуется проверка сцены {scene_idx}')
-                        await self.bring_terminal_to_front()
-                        print(f"\n🚨 ВНИМАНИЕ: ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО ПОЛЬЗОВАТЕЛЯ 🚨")
-                        print(f"👉 Проверь сцену {scene_idx} вручную на странице HeyGen.")
-                        print(f"👉 После исправления нажми Enter в этом окне (таймаут {self.confirm_timeout_sec} c)")
-                        print(f"============================================================\n")
-                        fut = asyncio.to_thread(input, "")
-                        await asyncio.wait_for(fut, timeout=self.confirm_timeout_sec)
-                        pressed = True
-                    except asyncio.TimeoutError:
-                        pass
-                    except Exception:
-                        pass
-                    try:
-                        cnt2 = await page.get_by_text(re.compile(re.escape(expected_text))).count()
-                        if cnt2 > 0:
-                            print(f"✅ Сцена {scene_idx} подтверждена {'вручную' if pressed else 'по таймауту'}")
-                            missing.pop()
-                            changed = True
-                            if pressed and self.report is not None:
-                                self.report['manual_intervention'].append({'scene_idx': scene_idx, 'step': 'text_confirm'})
-                    except Exception:
-                        pass
         if not missing:
             print("✅ Все ожидаемые тексты обнаружены на странице")
         else:
@@ -2285,18 +2841,18 @@ class HeyGenAutomation:
         print(f"{'='*60}\n")
         
         # Обрабатываем каждую часть
+        ok_all = True
         for i, part_idx in enumerate(parts, 1):
             print(f"\n{'='*60}")
             print(f"🎬 Обрабатываю {episode_id}, часть {part_idx} ({i}/{len(parts)})")
             print(f"{'='*60}\n")
             
             success = await self.process_episode_part(episode_id, part_idx)
-            
-            if not success:
-                print(f"❌ Ошибка при обработке части {part_idx}, останавливаюсь")
-                return False
-            
-            print(f"✅ Часть {part_idx} успешно обработана и отправлена на генерацию!")
+            ok_all = ok_all and bool(success)
+            if success:
+                print(f"✅ Часть {part_idx} успешно обработана и отправлена на генерацию!")
+            else:
+                print(f"⚠️ Часть {part_idx} завершена с ошибками")
             
             # Пауза между частями (кроме последней)
             if i < len(parts):
@@ -2308,7 +2864,7 @@ class HeyGenAutomation:
         print(f"🎉 ВСЕ ЧАСТИ ЭПИЗОДА {episode_id} ОБРАБОТАНЫ!")
         print(f"{'='*60}\n")
         
-        return True
+        return ok_all
 
 
 async def main():

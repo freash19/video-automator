@@ -28,6 +28,10 @@ class AutomationRunner:
         self.cancel = False
         self._tasks: List[asyncio.Task] = []
 
+    def _is_browser_closed_error(self, msg: str) -> bool:
+        text = str(msg or "")
+        return "Target page, context or browser has been closed" in text or "has been closed" in text
+
     def set_events(self, events: RunnerEvents):
         self.events = events
         try:
@@ -64,6 +68,14 @@ class AutomationRunner:
                 try:
                     ok = await self.automation.process_episode_part(ep, part)
                 except Exception as e:
+                    if self._is_browser_closed_error(str(e)):
+                        self.cancel = True
+                        for t in self._tasks:
+                            if not t.done():
+                                try:
+                                    t.cancel()
+                                except Exception:
+                                    pass
                     if self.events.on_notice:
                         self.events.on_notice(f"error: episode={ep} part={part} err={str(e)}")
                 rep = None
@@ -93,6 +105,11 @@ class AutomationRunner:
                 try:
                     from ui.state import update_project_status
                     update_project_status(ep, "completed" if ok else "failed")
+                except Exception:
+                    pass
+                try:
+                    if bool(self.config.get("close_browser_on_finish", True)):
+                        await self.automation.close_browser()
                 except Exception:
                     pass
                 return bool(ok)

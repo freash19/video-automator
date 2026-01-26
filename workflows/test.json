@@ -14,7 +14,7 @@
       "id": "2",
       "type": "wait_for",
       "params": {
-        "selector": ".tw-w-full:nth-child(3) > div:nth-child(2) > div span.tw-flex-1",
+        "selector": "text={{episode_id}}",
         "state": "visible",
         "timeout_ms": 60000
       }
@@ -24,12 +24,12 @@
       "type": "select_episode_parts",
       "params": {
         "episode": "{{episode_id}}",
-        "title_selector": ".tw-w-full:nth-child(3) > div:nth-child(2) > div span.tw-flex-1",
-        "checkbox_selector": ".tw-relative:nth-child(14) .tw-pointer-events-auto:nth-child(4) .tw-absolute:nth-child(1)",
-        "button_selector": "button.prism\\:disabled\\:tw-opacity-disabled:nth-child(2)",
+        "title_selector": "text={{episode_id}}",
+        "checkbox_selector": "role=checkbox",
+        "button_selector": "",
         "timeout_ms": 60000,
         "hover_sec": 0.15,
-        "card_xpath": "xpath=ancestor::div[contains(@class,\"tw-relative\")][1]"
+        "card_xpath": "xpath=ancestor::div[1]"
       }
     }
   ],

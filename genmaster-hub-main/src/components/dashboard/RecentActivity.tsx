@@ -37,12 +37,12 @@ export function RecentActivity() {
             const msg = raw ? JSON.parse(raw) : null;
             if (msg?.type === "start_part") {
               const ep = String(msg.episode);
-              byEp[ep] = { id: ep, episode: ep, status: "running", time: "now", duration: "—" };
+              byEp[ep] = { id: ep, episode: ep, status: "running", time: "сейчас", duration: "—" };
             }
             if (msg?.type === "finish_part") {
               const ep = String(msg.episode);
               const ok = Boolean(msg.ok);
-              byEp[ep] = { id: ep, episode: ep, status: ok ? "completed" : "failed", time: "recent", duration: "—" };
+              byEp[ep] = { id: ep, episode: ep, status: ok ? "completed" : "failed", time: "недавно", duration: "—" };
             }
           } catch (err) {
             void err;
