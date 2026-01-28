@@ -88,12 +88,18 @@ class Inspector:
         self.page = page
         self.elements = []
 
-    async def explore(self, url: str, target_description: Optional[str] = None, pause_before_scan: bool = False):
+    async def explore(
+        self,
+        url: str,
+        target_description: Optional[str] = None,
+        pause_before_scan: bool = False,
+        settle_ms: int = 5000,
+    ):
         print(f"Navigating to {url}...")
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             print("Page loaded (domcontentloaded). Waiting for network to settle...")
-            await self.page.wait_for_timeout(5000) # Give it time to render
+            await self.page.wait_for_timeout(settle_ms)  # Give it time to render
         except Exception as e:
             print(f"Navigation warning: {e}")
 
@@ -325,6 +331,12 @@ async def main():
     parser.add_argument("url", help="URL to inspect")
     parser.add_argument("--target", help="Description of target element to find", default=None)
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument(
+        "--settle-ms",
+        type=int,
+        default=5000,
+        help="Extra time to wait after domcontentloaded before scanning (ms)",
+    )
     args = parser.parse_args()
 
     cfg = _load_config()
@@ -333,7 +345,11 @@ async def main():
         browser = await _open_browser(p, cfg)
         
         # Load state if exists
-        context_args = {}
+        context_args = {
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "viewport": {"width": 1280, "height": 800},
+            "ignore_https_errors": True
+        }
         if os.path.exists(AUTH_STATE_PATH):
             print(f"Loading auth state from {AUTH_STATE_PATH}")
             context_args["storage_state"] = AUTH_STATE_PATH
@@ -343,6 +359,13 @@ async def main():
             context = contexts[0]
         else:
             context = await browser.new_context(**context_args)
+            
+        # Inject script to hide webdriver property
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
 
         if context_args and not contexts:
             # storage_state only applies to newly created context
@@ -355,7 +378,12 @@ async def main():
         
         # Explore
         inspector = Inspector(page)
-        await inspector.explore(args.url, args.target, pause_before_scan=not args.headless)
+        await inspector.explore(
+            args.url,
+            args.target,
+            pause_before_scan=not args.headless,
+            settle_ms=max(0, int(args.settle_ms)),
+        )
         
 
 if __name__ == "__main__":

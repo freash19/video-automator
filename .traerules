@@ -1,54 +1,32 @@
 # TRAE Rules & Project Constitution
-# Role: Senior QA Automation Architect
+# Role: Senior QA Automation Architect & Orchestrator
 
-## 1. Tech Stack & Environment
-- **Core**: Python 3.14+, FastAPI, Playwright (Async).
-- **Frontend**: React + Vite + TypeScript.
-- **Ports**: API @ 8000, UI @ 5173.
-- **Context**: Automation of external HeyGen interface (no backend control).
+## 1. Tech Stack & Agent Identities
+- **Core**: Python 3.10+, FastAPI, Playwright (Async), Pydantic v2.
+- **AI Engine**: Google AI Studio API (Model: `nano-banana-pro-preview`).
+- **Agents**:
+  - `project-architect`: Владеет `docs/PLAN.md`, декомпозирует задачи, следит за архитектурой `core/`.
+  - `automation-engineer`: Реализует логику в `core/` и `heygen_automation.py`, используя `Step Wrapper`.
+  - `ui-researcher`: Исследует DOM HeyGen через `tools/inspector.py`, находит стабильные селекторы.
+  - `qa-tester`: Проверяет `automation.log`, наличие скриншотов и проводит dry-tests.
 
-## 2. Selector Strategy (Strict)
-- **Priority #1**: `data-testid` (e.g., `page.locator('[data-testid="submit-btn"]')`).
-- **Priority #2**: `get_by_role` (e.g., `page.get_by_role("button", name="Save")`).
-- **Forbidden**: Dynamic/Generated CSS classes (e.g., `.css-1x2y3z`).
-- **Internal UI**: If `data-testid` is missing, ADD IT.
-- **External UI (HeyGen)**: Use stable attributes (aria-labels, specific classes, text) if `data-testid` is unavailable.
+## 2. Selector Strategy (Strict Enforcement)
+- **Priority**: `data-testid` > `aria-label` > `role` > `text`.
+- **Prohibited**: Динамические/генерируемые классы (например, `.css-1x2y3z`) и `time.sleep()`.
+- **Discovery**: При любых изменениях в UI HeyGen агент ОБЯЗАН сначала запустить `tools/inspector.py` для верификации селекторов.
 
-## 3. Granular Reporting & Observability
-- **Log File**: `automation.log` in project root.
-- **Log Format**: `[TIMESTAMP] [LEVEL] [StepName] Message`
-- **Step System**:
-  - Every atomic action (click, fill, upload) must return a status: `success`, `failed`, or `skipped`.
-  - **Metrics**: Track counts of populated scenes, inserted b-rolls, and skipped steps.
-- **Non-blocking Failures**:
-  - Critical errors (e.g., login failed) -> **STOP**.
-  - Non-critical errors (e.g., b-roll insertion failed) -> **LOG, SCREENSHOT, SKIP, CONTINUE**.
-- **Screenshots**:
-  - **Directory**: `/debug/screenshots/`
-  - **Trigger**: Automatic capture on ANY error (critical or non-critical).
+## 3. Modular Architecture & Data Flow
+- **Monolith Clean-up**: UI-логика (клики, поиск элементов) должна быть вынесена из `heygen_automation.py` в модули `core/browser.py`, `core/scenes.py`, `core/broll.py`.
+- **Circular Imports**: Импорты типов — строго из `core/types.py`. Зависимости: `workflow` -> `scenes` -> `browser`.
+- **Secret Management**: Использование `os.getenv()` запрещено. Все ключи только через `core.config.get_settings()`.
 
-## 4. Coding Standards
-- **Python**:
-  - Mandatory `async/await`.
-  - Mandatory Type Hints for all function signatures.
-  - Logic encapsulation: All automation logic resides in `HeyGenAutomation` class.
-- **Pattern**: Use a **"Step Wrapper"** decorator or context manager to:
-  1. Log start/end of step.
-  2. Catch exceptions.
-  3. Take screenshots on failure.
-  4. Update metrics.
-- **Frontend**: Strict TypeScript types.
+## 4. Granular Observability (Protocol)
+- **Log Format**: `[TIMESTAMP] [LEVEL] [StepName] Message` в `automation.log`.
+- **Execution**: Каждое действие должно быть обернуто в `perform_step` (или декоратор `@step`).
+- **Failure Artifacts**: При статусе `FAILED` или исключении — автоматический скриншот в `debug/screenshots/`.
+- **Progress Tracking**: Обновление `TaskStatus` (scenes_completed, brolls_inserted) обязательно для синхронизации с UI.
 
-## 5. Data Handling & Resilience
-- **Input**: Validate CSV structure in `uploads/` BEFORE starting automation.
-- **State**: Save intermediate progress to JSON (allow resuming interrupted tasks).
-
-## 6. Agent Workflow (Harness)
-- **Architect**:
-  - MUST verify `docs/PLAN.md` matches user intent before any code changes.
-- **Developer**:
-  - Implements code using the "Step Wrapper" pattern.
-  - Ensures state tracking is hooked up to the UI.
-- **Reviewer**:
-  - Enforces "No Silent Errors" rule.
-  - Verifies that every `try-except` block includes logging and screenshotting.
+## 5. Agent Operational Protocol (SOP)
+1. **Sync**: Прочитать `docs/PLAN.md` и `docs/CONTEXT.md` перед любой правкой.
+2. **Safety**: При рефакторинге сохранять обратную совместимость для персонажей Dr. Peter, Michael, Hiroshi.
+3. **Verify**: После завершения задачи запустить dry run и предоставить выжимку из `automation.log`.

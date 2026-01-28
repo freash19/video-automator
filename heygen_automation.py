@@ -12,7 +12,17 @@ from typing import Awaitable, Callable, Any
 from ui.step_wrapper import step
 from ui.logger import logger
 from automation_models import TaskStatus, AutomationStep, Metrics, StepStatus
-from core.broll import select_media_source, select_orientation
+from core.config import get_settings
+from core.broll import (
+    select_media_source, 
+    select_orientation, 
+    select_video_tab,
+    try_delete_foreground,
+    open_media_panel,
+    handle_nano_banano
+)
+from core.browser import prepare_canvas_for_broll, human_coordinate_click
+from utils.clipboard import parse_nano_banano_prompt
 
 class HeyGenAutomation:
     def __init__(self, csv_path: str, config: dict, browser=None, playwright=None):
@@ -272,6 +282,16 @@ class HeyGenAutomation:
                 raise
             return None
 
+    async def _take_error_screenshot(self, page: Page, name: str):
+        try:
+            ts = int(asyncio.get_event_loop().time() * 1000)
+            safe_name = "".join(ch for ch in name if ch.isalnum() or ch in "_-")
+            path = f"debug/screenshots/{safe_name}_{ts}.png"
+            await page.screenshot(path=path, full_page=True)
+            self._emit_notice(f"📸 screenshot: {path}")
+        except Exception as e:
+            self._emit_notice(f"⚠️ screenshot failed: {e}")
+
     def _block_generation_reason(self) -> str:
         if not self.report:
             return ""
@@ -395,141 +415,11 @@ class HeyGenAutomation:
 
     @step("open_media_panel")
     async def _open_media_panel(self, page: Page) -> bool:
-        try:
-            panel_header = page.locator('h2').filter(has_text=re.compile(r'^\s*(Медиа|Media)\s*$'))
-            if await panel_header.count() > 0:
-                return True
-        except Exception:
-            pass
-
-        candidates = []
-        try:
-            media_icon = page.locator('iconpark-icon[name="media2"]')
-            if await media_icon.count() > 0:
-                candidates.append(media_icon.first.locator('xpath=ancestor::button[1]'))
-        except Exception:
-            pass
-        try:
-            candidates.append(page.get_by_role('button', name=re.compile(r'^\s*(Медиа|Media)\s*$', re.I)))
-        except Exception:
-            pass
-        try:
-            candidates.append(page.locator('button').filter(has_text=re.compile(r'^\s*(Медиа|Media)\s*$', re.I)).first)
-        except Exception:
-            pass
-
-        for btn in candidates:
-            try:
-                if await btn.count() == 0:
-                    continue
-            except Exception:
-                continue
-            ok = await self._try_click(btn, page, timeout_ms=10000)
-            await self._broll_pause(0.2)
-            try:
-                panel_header = page.locator('h2').filter(has_text=re.compile(r'^\s*(Медиа|Media)\s*$'))
-                if ok and await panel_header.count() > 0:
-                    return True
-            except Exception:
-                pass
-
-        return False
+        return await open_media_panel(page, gate_callback=self._await_gate)
 
     async def _select_video_tab(self, page: Page) -> bool:
-        async def _is_active(loc: Locator) -> bool:
-            try:
-                v = await loc.get_attribute("aria-selected")
-                if v and str(v).lower() == "true":
-                    return True
-            except Exception:
-                pass
-            try:
-                v = await loc.get_attribute("data-state")
-                if v and str(v).lower() in ("active", "on", "open"):
-                    return True
-            except Exception:
-                pass
-            try:
-                v = await loc.get_attribute("data-active")
-                if v and str(v).lower() in ("true", "1"):
-                    return True
-            except Exception:
-                pass
-            try:
-                v = await loc.get_attribute("aria-current")
-                if v and str(v).lower() in ("true", "page", "tab"):
-                    return True
-            except Exception:
-                pass
-            return False
-        try:
-            ready = await self._locate_broll_search_input(page)
-            if ready is not None:
-                return True
-        except Exception:
-            pass
-        for name in ("Видео", "Video"):
-            try:
-                tab = page.get_by_role('tab', name=name)
-                if await tab.count() > 0:
-                    if await _is_active(tab.first):
-                        return True
-                    if await self._try_click(tab.first, page, timeout_ms=8000):
-                        await self._broll_pause(0.15)
-                        try:
-                            ready = await self._locate_broll_search_input(page)
-                            if ready is not None:
-                                return True
-                        except Exception:
-                            return True
-            except Exception:
-                pass
-            try:
-                btn = page.get_by_role('button', name=name)
-                if await btn.count() > 0:
-                    if await _is_active(btn.first):
-                        return True
-                    if await self._try_click(btn.first, page, timeout_ms=8000):
-                        await self._broll_pause(0.15)
-                        try:
-                            ready = await self._locate_broll_search_input(page)
-                            if ready is not None:
-                                return True
-                        except Exception:
-                            return True
-            except Exception:
-                pass
-        try:
-            vid_tab = page.locator('button[role="tab"]').filter(has_text=re.compile(r'^\s*(Видео|Video)\s*$'))
-            if await vid_tab.count() > 0:
-                if await _is_active(vid_tab.first):
-                    return True
-                if await self._try_click(vid_tab.first, page, timeout_ms=8000):
-                    await self._broll_pause(0.15)
-                    try:
-                        ready = await self._locate_broll_search_input(page)
-                        if ready is not None:
-                            return True
-                    except Exception:
-                        return True
-        except Exception:
-            pass
-        try:
-            fallback = page.locator('[role="tab"], [role="button"]').filter(has_text=re.compile(r'\b(Видео|Video)\b'))
-            if await fallback.count() > 0:
-                if await _is_active(fallback.first):
-                    return True
-                if await self._try_click(fallback.first, page, timeout_ms=8000):
-                    await self._broll_pause(0.15)
-                    try:
-                        ready = await self._locate_broll_search_input(page)
-                        if ready is not None:
-                            return True
-                    except Exception:
-                        return True
-        except Exception:
-            pass
-        return False
+        # Delegate to core.broll implementation which has been updated with fixes
+        return await select_video_tab(page, gate_callback=self._await_gate)
 
     async def _locate_broll_search_input(self, page: Page):
         try:
@@ -1270,7 +1160,7 @@ class HeyGenAutomation:
             print("  ✅ Название введено")
             
             # Находим кнопку "Отправить" в попапе
-            submit_button = page.locator('button:has-text("Отправить")')
+            submit_button = page.locator('button').filter(has_text=re.compile(r'Отправить|Submit', re.I))
             
             # Проверяем существование
             button_count = await submit_button.count()
@@ -1317,8 +1207,20 @@ class HeyGenAutomation:
             True если браузер успешно открыт
         """
         if self.browser is not None:
-            return True
-        
+            try:
+                # Check if browser is still connected
+                if self.playwright_context and self.playwright_context.pages:
+                    # Ping functionality or just assume true if pages exist
+                    return True
+                if self.browser.is_connected():
+                    return True
+            except Exception:
+                # If connection check failed, reset and try to launch again
+                print("⚠️ Browser connection lost, restarting...")
+                self.browser = None
+                self.playwright_context = None
+                self.page = None
+
         try:
             p = await async_playwright().start()
             self.playwright = p
@@ -1384,35 +1286,92 @@ class HeyGenAutomation:
                 pconf = profiles.get(profile_to_use, {})
                 browser_type = pconf.get('browser_type', 'chrome') # default to chrome if not specified
 
-                launch_kwargs = {
-                    "user_data_dir": abs_profile_path,
-                    "headless": False,
-                    "args": ["--disable-blink-features=AutomationControlled"]
-                }
-
-                if browser_type == 'chromium':
-                    print(f"ℹ️ Профиль {profile_to_use} использует Chromium (bundled)")
-                    # Не добавляем executable_path, Playwright использует свой
-                else:
-                    # Для 'chrome' пытаемся найти системный
-                    if os.path.exists(chrome_path):
-                        print(f"🚀 Found System Chrome: {chrome_path}")
-                        launch_kwargs["executable_path"] = chrome_path
-                    else:
-                        print(f"⚠️ System Chrome not found at {chrome_path}. Trying 'channel=chrome'...")
-                        launch_kwargs["channel"] = "chrome"
-
+                # Parse port from chosen_cdp (e.g., http://localhost:9222 -> 9222)
+                cdp_port = 9222
                 try:
-                    browser = await p.chromium.launch_persistent_context(**launch_kwargs)
-                    print(f"✅ Браузер запущен с профилем: {profile_to_use}")
-                except Exception as e:
-                    print(f"❌ Ошибка запуска браузера: {e}")
-                    print("⚠️ Пробую fallback на bundled Chromium...")
-                    # Fallback: remove executable_path/channel and try again
-                    launch_kwargs.pop("executable_path", None)
-                    launch_kwargs.pop("channel", None)
-                    browser = await p.chromium.launch_persistent_context(**launch_kwargs)
-                    print(f"✅ Fallback: Chromium запущен с профилем: {profile_to_use}")
+                    from urllib.parse import urlparse
+                    parsed = urlparse(chosen_cdp)
+                    if parsed.port:
+                        cdp_port = parsed.port
+                except Exception:
+                    pass
+
+                # Try to connect first if browser might be running
+                try:
+                    print(f"🔄 Trying to connect to existing browser at {chosen_cdp}...")
+                    browser = await p.chromium.connect_over_cdp(chosen_cdp)
+                    if browser.contexts:
+                        print(f"✅ Connected to existing browser at {chosen_cdp}")
+                        self.browser = browser
+                        self.playwright_context = browser.contexts[0]
+                        # Don't return yet, let it flow to page creation if needed
+                    else:
+                        print("⚠️ Connected but no contexts found.")
+                except Exception:
+                    print("ℹ️ No existing browser found, launching new one...")
+
+                if not self.browser:
+                    launch_kwargs = {
+                        "user_data_dir": abs_profile_path,
+                        "headless": False,
+                        "viewport": {"width": 1280, "height": 800}, # Use fixed viewport as requested
+                        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "ignore_https_errors": True,
+                        "locale": "ru-RU",  # Force Russian locale
+                        "args": [
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--ignore-certificate-errors",
+                            "--ignore-ssl-errors",
+                            "--allow-insecure-localhost",
+                            "--disable-web-security",
+                            "--enable-webgl",
+                            "--enable-accelerated-2d-canvas",
+                            "--ignore-gpu-blocklist",
+                            "--enable-gpu-rasterization",
+                            "--enable-zero-copy",
+                            "--disable-gpu-driver-bug-workarounds",
+                            "--no-default-browser-check",
+                            "--no-first-run",
+                            "--lang=ru-RU", # Force UI language
+                            f"--remote-debugging-port={cdp_port}",
+                        ]
+                    }
+
+                    if browser_type == 'chromium':
+                        print(f"ℹ️ Профиль {profile_to_use} использует Chromium (bundled)")
+                    else:
+                        # Для 'chrome' пытаемся найти системный
+                        if os.path.exists(chrome_path):
+                            print(f"🚀 Found System Chrome: {chrome_path}")
+                            launch_kwargs["executable_path"] = chrome_path
+                        else:
+                            print(f"⚠️ System Chrome not found at {chrome_path}. Trying 'channel=chrome'...")
+                            launch_kwargs["channel"] = "chrome"
+
+                    try:
+                        browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                        print(f"✅ Браузер запущен с профилем: {profile_to_use} на порту {cdp_port}")
+                        
+                        # Stealth init script
+                        try:
+                            await browser.add_init_script("""
+                                Object.defineProperty(navigator, 'webdriver', {
+                                    get: () => undefined
+                                });
+                            """)
+                            print("🕵️ Stealth script injected")
+                        except Exception as e:
+                            print(f"⚠️ Failed to inject stealth script: {e}")
+
+                    except Exception as e:
+                        print(f"❌ Ошибка запуска браузера: {e}")
+                        print("⚠️ Пробую fallback на bundled Chromium...")
+                        # Fallback: remove executable_path/channel and try again
+                        launch_kwargs.pop("executable_path", None)
+                        launch_kwargs.pop("channel", None)
+                        browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                        print(f"✅ Fallback: Chromium запущен с профилем: {profile_to_use}")
             else:
                 auth_state_path = "debug/auth_state.json"
                 launch_args = [
@@ -2223,6 +2182,35 @@ class HeyGenAutomation:
                 self.report['broll_skipped'].append({'scene_idx': scene_idx})
             return True
 
+        nano_prompt = parse_nano_banano_prompt(query)
+        if nano_prompt:
+            self._emit_notice("🧪 nano_banano_generate")
+            settings = get_settings()
+            out_dir = os.path.join(str(settings.local_storage_path or "./storage"), "nano_banano")
+            ok, err = await handle_nano_banano(
+                page,
+                nano_prompt,
+                scene_idx,
+                out_dir,
+                episode_id=str(self._current_episode_id or "episode"),
+                part_idx=int(self._current_part_idx or 0),
+                gate_callback=self._await_gate,
+            )
+            if not ok:
+                self._emit_notice(f"❌ nano_banano_error: {err}")
+                await self._take_error_screenshot(page, f"nano_banano_fail_{scene_idx}")
+                if self.report is not None:
+                    self.report.setdefault("nano_banano_errors", []).append(
+                        {"scene_idx": scene_idx, "prompt": nano_prompt, "error": str(err or "")}
+                    )
+                self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                return True
+
+            self._emit_notice(f"✅ nano_banano_done: scene={scene_idx}")
+            await self._take_error_screenshot(page, f"nano_banano_done_{scene_idx}")
+            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
+            return True
+
         try:
             text_label = f"text_{scene_idx}"
             span_locator = page.locator('span[data-node-view-content-react]').filter(
@@ -2248,9 +2236,15 @@ class HeyGenAutomation:
         except Exception:
             pass
 
+        try:
+            await prepare_canvas_for_broll(page)
+        except Exception:
+            pass
+
         if not await self._open_media_panel(page):
             err = "не удалось открыть панель Медиа"
             self._emit_notice(f"❌ broll_error: {err}")
+            await self._take_error_screenshot(page, f"broll_panel_fail_{scene_idx}")
             if self.report is not None:
                 self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
             if self.enable_notifications:
@@ -2264,6 +2258,7 @@ class HeyGenAutomation:
         if not await self._select_video_tab(page):
             err = "вкладка Видео/Video не найдена"
             self._emit_notice(f"❌ broll_error: {err}")
+            await self._take_error_screenshot(page, f"broll_tab_fail_{scene_idx}")
             if self.report is not None:
                 self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
             if self.enable_notifications:
@@ -2291,236 +2286,162 @@ class HeyGenAutomation:
 
         await self._broll_pause(0.2)
 
-        # Поле поиска → ввести запрос
-        search_input = None
-        try:
-            self._emit_notice("🔎 broll_search")
-            search_input = await self._locate_broll_search_input(page)
-            if not search_input:
-                raise RuntimeError("поисковое поле не найдено")
-            try:
-                await search_input.focus(timeout=6000)
-            except Exception:
-                try:
-                    await search_input.click(timeout=6000)
-                except Exception:
-                    pass
-            await self._broll_pause(0.1)
-            try:
-                await search_input.fill(query, timeout=6000)
-            except Exception:
-                try:
-                    await search_input.click(timeout=6000)
-                except Exception:
-                    pass
-                try:
-                    await page.keyboard.press('Meta+A')
-                    await self._broll_pause(0.05)
-                    await page.keyboard.press('Backspace')
-                    await self._broll_pause(0.05)
-                    await page.keyboard.insert_text(query)
-                except Exception:
-                    pass
-            await self._broll_pause(0.15)
-            try:
-                await page.keyboard.press('Enter')
-            except Exception:
-                pass
-        except Exception as e:
-            err = f"не удалось выполнить поиск: {e}"
-            self._emit_notice(f"❌ broll_error: {err}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: поиск не выполнен (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
+        # Поле поиска и выбор
+        self._emit_notice("🔎 broll_search")
 
-        # Ожидание результатов до 5 сек или до появления карточек
-        try:
-            await page.wait_for_timeout(300)
-            card = await self._locate_broll_result_card(page)
-            if card is None:
-                raise RuntimeError("result_card_not_found")
-        except Exception:
-            # Сокращаем запрос по последнему слову до 2 слов
-            try:
-                words = query.split()
-                while len(words) > 2:
-                    words = words[:-1]
-                    q2 = ' '.join(words)
-                    if search_input:
-                        await self._try_click(search_input, page, timeout_ms=6000)
-                    await page.keyboard.press('Meta+A')
-                    await page.keyboard.press('Backspace')
-                    await page.keyboard.insert_text(q2)
-                    await page.keyboard.press('Enter')
-                    try:
-                        await page.wait_for_timeout(300)
-                        card = await self._locate_broll_result_card(page)
-                        if card is not None:
-                            query = q2
-                            break
-                    except Exception:
-                        continue
-                else:
-                    err = f"результаты не найдены для запроса '{query}'"
-                    self._emit_notice(f"❌ broll_no_results: {err}")
-                    if self.report is not None:
-                        self.report['broll_no_results'].append({'scene_idx': scene_idx, 'query': query})
-                    if self.enable_notifications:
-                        await self.notify('HeyGen', f'B-roll без результатов (scene {scene_idx})')
-                    self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-                    return False
-            except Exception as e2:
-                err = f"ошибка при повторном поиске: {e2}"
+        current_query = str(query).strip()
+        found = False
+
+        while True:
+            await self._await_gate()
+
+            search_input = await self._locate_broll_search_input(page)
+            if search_input is None:
+                err = "поле поиска B-roll не найдено"
                 self._emit_notice(f"❌ broll_error: {err}")
+                await self._take_error_screenshot(page, f"broll_search_input_fail_{scene_idx}")
                 if self.report is not None:
-                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
+                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
                 if self.enable_notifications:
-                    await self.notify('HeyGen', f'B-roll: ошибка поиска (scene {scene_idx})')
+                    await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
                 self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
                 return False
 
-        # Выбрать первый видео-результат
-        try:
-            self._emit_notice("🧩 broll_pick_first")
-            first_card = await self._locate_broll_result_card(page)
-            if first_card is None:
-                raise RuntimeError("result_card_not_found")
             try:
-                await first_card.click(timeout=8000, force=True)
+                await search_input.scroll_into_view_if_needed()
             except Exception:
-                box = await first_card.bounding_box()
-                if box:
-                    await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-            await self._broll_pause(float(self.broll_before_make_bg_wait_sec))
-        except Exception as e:
-            err = f"не удалось выбрать первый результат: {e}"
-            self._emit_notice(f"❌ broll_error: {err}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: не удалось выбрать результат (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
-
-        # Нажать "Сделать фоном"
-        broll_applied = False
-        try:
-            self._emit_notice("🖼️ broll_make_background")
-            did_click = False
-            for attempt in range(1, 4):
-                self._emit_notice(f"🖼️ broll_make_background_try: {attempt}/3")
-                if not did_click:
-                    clicked_this_attempt = False
-                    make_bg_btn = page.locator("button").filter(
-                        has_text=re.compile(r"(Сделать фоном|Сделать фон|Set as background|Make background)", re.I)
-                    )
-                    if await make_bg_btn.count() > 0:
-                        clicked_this_attempt = await self._try_click(make_bg_btn.first, page, timeout_ms=12000)
-                    if not clicked_this_attempt:
-                        try:
-                            alt_btns = page.locator('button:has(iconpark-icon[name="detachfromframe"])')
-                            c = await alt_btns.count()
-                            if c > 0:
-                                clicked_this_attempt = await self._try_click(alt_btns.last, page, timeout_ms=12000)
-                        except Exception:
-                            clicked_this_attempt = False
-                    if not clicked_this_attempt:
-                        try:
-                            menu_item = page.locator("[role='menuitem']").filter(
-                                has_text=re.compile(r"(Сделать фоном|Set as background|Make background)", re.I)
-                            )
-                            if await menu_item.count() > 0:
-                                clicked_this_attempt = await self._try_click(menu_item.first, page, timeout_ms=12000)
-                        except Exception:
-                            pass
-                    if not clicked_this_attempt:
-                        try:
-                            inside = first_card.locator("button").filter(
-                                has_text=re.compile(r"(Сделать фоном|Set as background|Make background)", re.I)
-                            )
-                            if await inside.count() > 0:
-                                clicked_this_attempt = await self._try_click(inside.first, page, timeout_ms=12000)
-                        except Exception:
-                            pass
-                    if not clicked_this_attempt:
-                        try:
-                            inside_detach = first_card.locator('iconpark-icon[name="detachfromframe"]').first.locator(
-                                "xpath=ancestor::button[1]"
-                            )
-                            if await inside_detach.count() > 0:
-                                clicked_this_attempt = await self._try_click(inside_detach.first, page, timeout_ms=12000)
-                        except Exception:
-                            pass
-                    if not clicked_this_attempt:
-                        try:
-                            self._emit_notice("🖼️ broll_make_background_focus_scene")
-                            if await self._click_scene_center(page):
-                                await self._broll_pause(0.25)
-                            make_bg_btn2 = page.locator("button").filter(
-                                has_text=re.compile(r"(Сделать фоном|Сделать фон|Set as background|Make background)", re.I)
-                            )
-                            if await make_bg_btn2.count() > 0:
-                                clicked_this_attempt = await self._try_click(make_bg_btn2.first, page, timeout_ms=12000)
-                        except Exception:
-                            pass
-                    did_click = bool(clicked_this_attempt)
-
-                if did_click:
-                    broll_applied = await self._confirm_broll_added(page, min_wait_sec=self.broll_after_make_bg_min_wait_sec)
-                    if broll_applied:
-                        break
-                await self._broll_pause(0.35)
-            if not did_click:
+                pass
+            try:
+                await search_input.click(timeout=3000)
+            except Exception:
                 try:
-                    self._emit_notice("⚠️ broll_skip_make_background: button_not_found")
-                    if self.report is not None:
-                        self.report['broll_skipped'].append({'scene_idx': scene_idx, 'query': query, 'reason': 'make_bg_btn_missing'})
+                    await search_input.click(timeout=3000, force=True)
                 except Exception:
                     pass
+
+            await self._await_gate()
+            try:
+                await page.keyboard.press('Meta+A')
+                await page.keyboard.press('Backspace')
+                await page.keyboard.insert_text(current_query)
+                await page.keyboard.press('Enter')
+            except Exception as e:
+                err = f"не удалось ввести запрос B-roll: {e}"
+                self._emit_notice(f"❌ broll_error: {err}")
+                await self._take_error_screenshot(page, f"broll_search_type_fail_{scene_idx}")
+                if self.report is not None:
+                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
                 self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-                return True
-        except Exception as e:
-            err = f"не удалось нажать 'Сделать фоном': {e}"
+                return False
+
+            await page.wait_for_timeout(3000)
+
+            try:
+                media_header = page.get_by_role(
+                    "heading",
+                    level=2,
+                    name=re.compile(r"^\s*(Медиа|Media)\s*$", re.I),
+                )
+                media_panel = page.locator("aside, section, div").filter(has=media_header).first
+                active_panel = media_panel.locator('[role="tabpanel"][data-state="active"]').first
+                try:
+                    if await active_panel.count() == 0:
+                        active_panel = media_panel
+                except Exception:
+                    active_panel = media_panel
+
+                no_data = active_panel.locator('div:not(.tw-hidden)').filter(
+                    has_text=re.compile(r"\b(No\s+data|No\s+results\s+found)\b", re.I)
+                )
+                has_no_data = await no_data.count() > 0
+            except Exception:
+                has_no_data = False
+
+            if has_no_data:
+                words = current_query.split()
+                if len(words) > 1:
+                    current_query = ' '.join(words[:-1])
+                    self._emit_notice(f"⚠️ broll_retry: сокращаю запрос до '{current_query}'")
+                    continue
+                break
+
+            try:
+                imgs = active_panel.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
+            except Exception:
+                imgs = page.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
+            try:
+                await imgs.first.wait_for(state='attached', timeout=20000)
+                first_img = None
+                vs = None
+                try:
+                    vs = page.viewport_size
+                except Exception:
+                    vs = None
+                if vs and vs.get("width"):
+                    vw = float(vs["width"])
+                else:
+                    try:
+                        vw = float(await page.evaluate("() => window.innerWidth"))
+                    except Exception:
+                        vw = 0.0
+                try:
+                    cnt = await imgs.count()
+                except Exception:
+                    cnt = 0
+                for i in range(min(cnt, 60)):
+                    cand = imgs.nth(i)
+                    try:
+                        box = await cand.bounding_box()
+                        if not box:
+                            continue
+                        if vw and float(box.get("x", 0.0)) <= vw * 0.5:
+                            continue
+                        try:
+                            nw = int(await cand.evaluate("el => el.naturalWidth || 0"))
+                        except Exception:
+                            nw = 0
+                        if nw <= 1:
+                            continue
+                        if await cand.is_visible():
+                            first_img = cand
+                            break
+                    except Exception:
+                        continue
+                if first_img is None:
+                    raise RuntimeError("no visible broll results")
+            except Exception:
+                words = current_query.split()
+                if len(words) > 1:
+                    current_query = ' '.join(words[:-1])
+                    self._emit_notice(f"⚠️ broll_retry: результатов не видно, сокращаю запрос до '{current_query}'")
+                    continue
+                break
+
+            clicked = await human_coordinate_click(page, first_img)
+            if clicked:
+                found = True
+                break
+
+            err = "не удалось кликнуть первый результат B-roll"
             self._emit_notice(f"❌ broll_error: {err}")
+            await self._take_error_screenshot(page, f"broll_click_result_fail_{scene_idx}")
             if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
+                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
+            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+            return False
+        
+        if not found:
+            err = f"результаты не найдены для запроса '{query}'"
+            self._emit_notice(f"❌ broll_no_results: {err}")
+            await self._take_error_screenshot(page, f"broll_no_results_{scene_idx}")
+            if self.report is not None:
+                self.report['broll_no_results'].append({'scene_idx': scene_idx, 'query': query})
             if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: не удалось сделать фоном (scene {scene_idx})')
+                await self.notify('HeyGen', f'B-roll без результатов (scene {scene_idx})')
             self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
             return False
 
         await self._broll_pause(0.25)
-
-        if not broll_applied:
-            err = "не удалось подтвердить добавление B-roll"
-            self._emit_notice(f"❌ broll_error: {err}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: не добавился (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
-
-        self._emit_notice("🗑️ broll_delete_foreground")
-        deleted = False
-        for attempt in range(1, 4):
-            self._emit_notice(f"🗑️ broll_delete_foreground_try: {attempt}/3")
-            deleted = await self._try_delete_foreground(page)
-            if deleted:
-                break
-            await self._broll_pause(0.25)
-        if not deleted:
-            err = "не удалось удалить передний слой"
-            self._emit_notice(f"❌ broll_error: {err}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: не удалился слой (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
 
         if self.close_media_panel_after_broll:
             try:
@@ -2533,6 +2454,7 @@ class HeyGenAutomation:
 
         # Без ручной проверки: продолжаем по тайм-аутам
         self._emit_notice(f"✅ broll_done: scene={scene_idx}")
+        await self._take_error_screenshot(page, f"broll_done_{scene_idx}")
         self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
         return True
 

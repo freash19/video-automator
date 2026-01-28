@@ -2,6 +2,18 @@ import logging
 import os
 import sys
 
+class MultiLineFormatter(logging.Formatter):
+    def format(self, record):
+        msg = record.getMessage()
+        if msg is None:
+            msg = ""
+        lines = str(msg).splitlines() or [""]
+        base = f"[{self.formatTime(record, self.datefmt)}] [{record.levelname}] "
+        rendered = "\n".join(base + line for line in lines)
+        if record.exc_info:
+            rendered = rendered + "\n" + self.formatException(record.exc_info)
+        return rendered
+
 def setup_logger(name="automation", log_file="automation.log", level=logging.INFO):
     """
     Sets up a logger that writes to both file and console.
@@ -13,11 +25,11 @@ def setup_logger(name="automation", log_file="automation.log", level=logging.INF
     if logger.hasHandlers():
         return logger
     
-    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+    formatter = MultiLineFormatter()
     
     # File Handler
     try:
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     except Exception as e:

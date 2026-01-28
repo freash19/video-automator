@@ -24,6 +24,8 @@ automation.log
 -/
 chrome_automation/
 chrome_3/
+chrome_data/
+storage/
 *.log
 state/
 uploads/

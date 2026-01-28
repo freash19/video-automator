@@ -47,7 +47,7 @@ def get_nano_banano_model() -> str:
         Model name (e.g., "nano-banano-pro" or "imagen-3.0-generate-002")
     """
     settings = get_settings()
-    return settings.nano_banano_model or "nano-banano-pro"
+    return settings.nano_banano_model or "nano-banana-pro-preview"
 
 
 def generate_image_sync(prompt: str, model: str, api_key: str) -> Tuple[bytes, str]:
@@ -75,13 +75,23 @@ def generate_image_sync(prompt: str, model: str, api_key: str) -> Tuple[bytes, s
         raise RuntimeError("model name missing")
     
     model_key = model_name.split("/")[-1]
+
+    if model_key == "nano-banano-pro":
+        model_key = "nano-banana-pro-preview"
+        model_name = model_key
     
     # Imagen-style models use predict endpoint
     if model_key.startswith("imagen-"):
         return _generate_imagen(prompt, model_key, api_key)
     
     # Gemini-style models use generateContent endpoint
-    return _generate_gemini(prompt, model_name, api_key)
+    try:
+        return _generate_gemini(prompt, model_name, api_key)
+    except RuntimeError as e:
+        msg = str(e)
+        if "NOT_FOUND" in msg:
+            return _generate_imagen(prompt, "imagen-4.0-generate-001", api_key)
+        raise
 
 
 def _generate_imagen(prompt: str, model_key: str, api_key: str) -> Tuple[bytes, str]:

@@ -142,8 +142,7 @@ async def insert_text_in_scene(
         
         await page.keyboard.insert_text(text)
         await asyncio.sleep(random.uniform(0.1, 0.2))
-        await page.keyboard.press('Tab')
-        await asyncio.sleep(random.uniform(0.1, 0.2))
+        # Tab removed as per requirements
         
         # Optional: Enhance Voice button
         if enable_enhance_voice:

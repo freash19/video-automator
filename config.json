@@ -1,10 +1,10 @@
 {
-  "csv_file": "/Users/ilya/Projects/heygen_automation_V2/state/run_projects_1769436340.csv",
+  "csv_file": "/Users/ilya/Projects/heygen_automation_V2/state/run_projects_1769609681.csv",
   "max_scenes": 70,
   "browser": "chrome",
   "enable_enhance_voice": false,
   "playwright_timeout_ms": 8000,
-  "force_embedded_browser": false,
+  "force_embedded_browser": true,
   "debug_keep_browser_open_on_error": true,
   "pre_fill_wait": 1.5,
   "delay_between_scenes": 1,
@@ -61,7 +61,7 @@
     "profile_to_use": "Какой профиль использовать (имя или 'ask')"
   },
   "episodes_to_process": [
-    "ep_japanese_foods"
+    "ep_acupressure"
   ],
   "close_media_panel_after_broll": true,
   "interactive_on_mismatch": false,
@@ -69,18 +69,20 @@
   "profiles": {
     "chrome_automation": {
       "cdp_url": "http://localhost:9222",
-      "profile_path": "./chrome_data/automation_profile"
+      "profile_path": "./chrome_data/automation_profile",
+      "browser_type": "chromium"
     },
     "chrome_heygen_2": {
       "cdp_url": "http://localhost:9223",
-      "profile_path": "~/chrome_heygen_2"
+      "profile_path": "~/chrome_heygen_2",
+      "browser_type": "chromium"
     },
     "profile_3": {
-      "profile_path": "-/chrome_3",
+      "profile_path": "./chrome_data/profile_3",
       "browser_type": "chromium"
     }
   },
-  "profile_to_use": "profile_3",
+  "profile_to_use": "chrome_automation",
   "nano_banano_model": "gemini-3-pro-image-preview",
   "headless": false,
   "telegram_bot_token": "8494779397:AAGsD7yb1yUFS45JqkV-xgMxxTnivBakXzo",
@@ -92,7 +94,7 @@
   "download_dir": "./downloads",
   "max_concurrency": 1,
   "parallel_mode": "tabs",
-  "chrome_cdp_url": "http://localhost:9223",
+  "chrome_cdp_url": "http://localhost:9222",
   "multilogin_cdp_url": "",
   "checks": {
     "verify_scene": {

@@ -183,30 +183,112 @@ async def click_canvas_center(page: "Page") -> bool:
     Returns:
         True if click succeeded
     """
+    return await prepare_canvas_for_broll(page)
+
+
+async def _show_click_marker(page: "Page", x: float, y: float) -> None:
+    try:
+        await page.evaluate(
+            """
+            ({ x, y }) => {
+              try {
+                const id = `__heygen_click_marker_${Date.now()}_${Math.floor(Math.random() * 1e9)}`;
+                const el = document.createElement('div');
+                el.id = id;
+                el.style.position = 'fixed';
+                el.style.left = `${x - 10}px`;
+                el.style.top = `${y - 10}px`;
+                el.style.width = '20px';
+                el.style.height = '20px';
+                el.style.background = 'red';
+                el.style.border = '2px solid rgba(255, 255, 255, 0.85)';
+                el.style.borderRadius = '50%';
+                el.style.zIndex = '2147483647';
+                el.style.pointerEvents = 'none';
+                document.documentElement.appendChild(el);
+                setTimeout(() => {
+                  try {
+                    const n = document.getElementById(id);
+                    if (n && n.parentNode) n.parentNode.removeChild(n);
+                  } catch (e) {}
+                }, 2000);
+              } catch (e) {}
+            }
+            """,
+            {"x": x, "y": y},
+        )
+    except Exception:
+        return
+
+
+async def human_coordinate_click(page: "Page", locator: "Locator") -> bool:
     try:
         try:
-            await page.keyboard.press("Escape")
+            await locator.scroll_into_view_if_needed()
         except Exception:
             pass
-        
-        canvas = page.locator("canvas").first
-        box = await canvas.bounding_box()
-        
-        if box:
-            await page.mouse.click(
-                box["x"] + box["width"] * 0.5,
-                box["y"] + box["height"] * 0.5,
-            )
+
+        try:
+            await locator.wait_for(state="visible", timeout=5000)
+        except Exception:
+            pass
+
+        box = await locator.bounding_box()
+        if not box:
+            return False
+
+        x = box["x"] + box["width"] * 0.5
+        y = box["y"] + box["height"] * 0.5
+
+        await _show_click_marker(page, x, y)
+        await page.mouse.move(x, y)
+        await page.mouse.down()
+        try:
+            await locator.focus()
+        except Exception:
+            pass
+        await asyncio.sleep(0.15)
+        await page.mouse.up()
+        await page.mouse.click(x, y)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def prepare_canvas_for_broll(page: "Page") -> bool:
+    try:
+        canvas_wrapper = page.locator("#editorCanvasWrapper")
+        try:
+            await canvas_wrapper.wait_for(state="visible", timeout=5000)
+        except Exception:
+            pass
+
+        clicked = await human_coordinate_click(page, canvas_wrapper)
+        if not clicked:
+            canvas = page.locator("canvas").first
+            clicked = await human_coordinate_click(page, canvas)
+
+        if not clicked:
+            return False
+
+        await asyncio.sleep(0.5)
+        try:
+            await page.keyboard.press("Delete")
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+        if await human_coordinate_click(page, canvas_wrapper):
             return True
-        
-        # Fallback to viewport center
-        vs = page.viewport_size
-        if vs:
-            await page.mouse.click(vs["width"] * 0.5, vs["height"] * 0.5)
-            return True
+        return await human_coordinate_click(page, page.locator("canvas").first)
+
+    except asyncio.CancelledError:
+        raise
     except Exception:
         pass
-    
+
     return False
 
 
