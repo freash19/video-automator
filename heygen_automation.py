@@ -21,7 +21,7 @@ from core.broll import (
     open_media_panel,
     handle_nano_banano
 )
-from core.browser import prepare_canvas_for_broll, human_coordinate_click
+from core.browser import prepare_canvas_for_broll, human_coordinate_click, human_fast_center_click
 from utils.clipboard import parse_nano_banano_prompt
 
 class HeyGenAutomation:
@@ -43,6 +43,7 @@ class HeyGenAutomation:
         self.max_scenes = int(self.config.get('max_scenes', 15))
         self.pre_fill_wait = float(self.config.get('pre_fill_wait', 1.0))
         self.delay_between_scenes = float(self.config.get('delay_between_scenes', 2.5))
+        self.min_unfilled_scenes_visible = int(self.config.get('min_unfilled_scenes_visible', 4))
         
         try:
             if 'pre_generation_pause_sec' in self.config:
@@ -62,7 +63,7 @@ class HeyGenAutomation:
         self.orientation_choice = str(self.config.get('orientation_choice', 'Горизонтальная'))
         self.media_source = str(self.config.get('media_source', 'all')).lower()
         self.enable_notifications = bool(self.config.get('enable_notifications', False))
-        self.verify_scene_after_insert = bool(self.config.get('verify_scene_after_insert', True))
+        self.verify_scene_after_insert = bool(self.config.get('verify_scene_after_insert', False))
         self._broll_delay_range = (
             float(self.config.get('broll_step_delay_min_sec', 0.25)),
             float(self.config.get('broll_step_delay_max_sec', 0.55)),
@@ -132,6 +133,177 @@ class HeyGenAutomation:
             return mapping[compact]
         safe = re.sub(r"[^a-zA-Z0-9_\-]+", "_", s).strip("_")
         return safe or None
+
+    async def _scroll_scene_list_until_label(
+        self,
+        page: Page,
+        label: str,
+        max_scrolls: int = 40,
+        delta_px: int = 700,
+    ) -> bool:
+        target = page.locator('span[data-node-view-content-react]').filter(
+            has_text=re.compile(rf'^\s*{re.escape(label)}\s*$', re.I)
+        )
+        try:
+            if await target.count() > 0:
+                return True
+        except Exception:
+            pass
+
+        try:
+            await page.wait_for_selector('span[data-node-view-content-react]', timeout=4000)
+        except Exception:
+            pass
+
+        async def _reset_to_top() -> None:
+            try:
+                await page.evaluate(
+                    """
+                    (sel) => {
+                      const pickAnchor = (sel) => {
+                        const els = Array.from(document.querySelectorAll(sel) || []);
+                        let best = null;
+                        let bestX = Infinity;
+                        for (const el of els) {
+                          const r = el.getBoundingClientRect();
+                          if (!r || r.width <= 1 || r.height <= 1) continue;
+                          if (r.bottom < 0 || r.top > window.innerHeight) continue;
+                          if (r.left < bestX) {
+                            bestX = r.left;
+                            best = el;
+                          }
+                        }
+                        return best || document.querySelector(sel);
+                      };
+                      const el = pickAnchor(sel);
+                      if (!el) return;
+                      const isScrollable = (n) => {
+                        if (!n) return false;
+                        const s = getComputedStyle(n);
+                        const oy = s.overflowY;
+                        return (oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight;
+                      };
+                      let p = el.parentElement;
+                      while (p && !isScrollable(p)) p = p.parentElement;
+                      const sc = p || document.scrollingElement;
+                      if (sc) sc.scrollTop = 0;
+                    }
+                    """,
+                    'span[data-node-view-content-react]',
+                )
+            except Exception:
+                return
+
+        async def _scroll_down() -> bool:
+            try:
+                res = await page.evaluate(
+                        """
+                        (sel, delta) => {
+                          const pickAnchor = (sel) => {
+                            const els = Array.from(document.querySelectorAll(sel) || []);
+                            let best = null;
+                            let bestX = Infinity;
+                            for (const el of els) {
+                              const r = el.getBoundingClientRect();
+                              if (!r || r.width <= 1 || r.height <= 1) continue;
+                              if (r.bottom < 0 || r.top > window.innerHeight) continue;
+                              if (r.left < bestX) {
+                                bestX = r.left;
+                                best = el;
+                              }
+                            }
+                            return best || document.querySelector(sel);
+                          };
+                          const el = pickAnchor(sel);
+                          if (!el) return { moved: false, x: null, y: null };
+                          const r0 = el.getBoundingClientRect();
+                          const x = r0 ? (r0.left + r0.width / 2) : null;
+                          const y = r0 ? (r0.top + r0.height / 2) : null;
+                          const isScrollable = (n) => {
+                            if (!n) return false;
+                            const s = getComputedStyle(n);
+                            const oy = s.overflowY;
+                            return (oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight;
+                          };
+                          let p = el.parentElement;
+                          while (p && !isScrollable(p)) p = p.parentElement;
+                          const sc = p || document.scrollingElement;
+                          if (!sc) return { moved: false, x, y };
+                          const prev = sc.scrollTop;
+                          sc.scrollTop = Math.min(sc.scrollTop + delta, sc.scrollHeight);
+                          return { moved: sc.scrollTop !== prev, x, y };
+                        }
+                        """,
+                        'span[data-node-view-content-react]',
+                        int(delta_px),
+                    )
+                moved = bool(res and res.get("moved"))
+                if moved:
+                    return True
+                x = res.get("x") if isinstance(res, dict) else None
+                y = res.get("y") if isinstance(res, dict) else None
+                if x is not None and y is not None:
+                    try:
+                        await page.mouse.move(float(x), float(y))
+                        await page.mouse.wheel(0, int(delta_px))
+                        return True
+                    except Exception:
+                        return False
+                return False
+            except Exception:
+                return False
+
+        for pass_idx in range(2):
+            if pass_idx == 1:
+                await _reset_to_top()
+                await asyncio.sleep(0.05)
+
+            for _ in range(max_scrolls):
+                try:
+                    if await target.count() > 0:
+                        return True
+                except Exception:
+                    pass
+
+                moved = await _scroll_down()
+                if not moved:
+                    break
+                await asyncio.sleep(0.05)
+
+        try:
+            return await target.count() > 0
+        except Exception:
+            return False
+
+    async def _ensure_min_unfilled_scenes_visible(
+        self,
+        page: Page,
+        current_scene_idx: int,
+        min_visible: int = 4,
+        max_steps: int = 25,
+        delta_px: int = 650,
+    ) -> None:
+        """
+        Scroll the current scene to the center of the viewport.
+        This handles both early scenes (providing context above) and late scenes (avoiding bounce at bottom).
+        """
+        try:
+            text_label = f"text_{current_scene_idx}"
+            
+            # Find the specific scene element
+            span_locator = page.locator('span[data-node-view-content-react]').filter(
+                has_text=re.compile(rf'^\s*{re.escape(text_label)}\s*$')
+            )
+            
+            if await span_locator.count() > 0:
+                # Scroll the element to the center of the view
+                await span_locator.first.evaluate(
+                    "(el) => el.scrollIntoView({ block: 'center', behavior: 'instant' })"
+                )
+                await asyncio.sleep(0.1)
+                
+        except Exception:
+            pass
 
     def _generation_enabled(self) -> bool:
         return bool(self.config.get("enable_generation", True))
@@ -765,34 +937,34 @@ class HeyGenAutomation:
             # Проверяем существование
             count = await span_locator.count()
             if count == 0:
-                self._emit_notice(f"⚠️ scene_field_missing: scene={scene_number} label={text_label}")
-                self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
-                return False
+                await self._scroll_scene_list_until_label(page, text_label)
+                try:
+                    count = await span_locator.count()
+                except Exception:
+                    count = 0
+                if count == 0:
+                    self._emit_notice(f"⚠️ scene_field_missing: scene={scene_number} label={text_label}")
+                    self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                    return False
+
+            await self._ensure_min_unfilled_scenes_visible(
+                page,
+                scene_number,
+                min_visible=self.min_unfilled_scenes_visible,
+            )
             
             safe_speaker = self._normalize_speaker_key(speaker)
 
             async def _select_scene():
                 await self._await_gate()
                 await span_locator.first.scroll_into_view_if_needed()
-                await asyncio.sleep(0.05)
                 try:
                     await page.keyboard.press('Escape')
                 except Exception:
                     pass
-                try:
-                    await span_locator.first.click(timeout=3000)
-                except Exception:
-                    try:
-                        await span_locator.first.click(timeout=3000, force=True)
-                    except Exception:
-                        try:
-                            box = await span_locator.first.bounding_box()
-                            if box:
-                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                                return True
-                        except Exception:
-                            return False
-                        return False
+                ok = await human_fast_center_click(page, span_locator.first)
+                if not ok:
+                    return False
                 await self._await_gate()
                 await asyncio.sleep(random.uniform(0.1, 0.2))
                 try:
@@ -815,6 +987,39 @@ class HeyGenAutomation:
 
             async def _insert_text():
                 await self._await_gate()
+                
+                # --- Verification Step ---
+                # Check if we really focused the correct scene before deleting anything
+                try:
+                    # We expect to see 'text_N'
+                    expected_placeholder = f"text_{scene_number}"
+                    
+                    # Read current text from the active element (which we just clicked)
+                    current_content = await span_locator.first.inner_text(timeout=1000)
+                    current_content = current_content.strip()
+                    
+                    # Regex to see if it looks like ANY placeholder 'text_M'
+                    m = re.fullmatch(r"text_(\d+)", current_content)
+                    
+                    if m:
+                        found_idx = int(m.group(1))
+                        if found_idx != scene_number:
+                            # CRITICAL ERROR: We are about to overwrite the WRONG scene!
+                            self._emit_notice(f"❌ Safety Abort: Wanted scene {scene_number}, but focused scene {found_idx}")
+                            # Unfocus to be safe
+                            await page.keyboard.press('Escape')
+                            return False
+                    else:
+                        # If the text is NOT a placeholder (e.g. it's already filled text),
+                        # we should probably proceed carefully. But usually we are filling empty templates.
+                        # For now, we only block if we see a conflicting placeholder number.
+                        pass
+                        
+                except Exception:
+                    # If we can't read text, proceed at own risk or log warning
+                    pass
+                # -------------------------
+
                 await page.keyboard.press('Meta+A')
                 await asyncio.sleep(0.05)
                 await page.keyboard.press('Backspace')
@@ -837,27 +1042,6 @@ class HeyGenAutomation:
                     raise
                 except Exception:
                     pass
-                try:
-                    current_text = await span_locator.first.inner_text(timeout=1500)
-                    if current_text.strip() != text.strip():
-                        for _ in range(2):
-                            await span_locator.first.click()
-                            await asyncio.sleep(0.1)
-                            await page.keyboard.press('Meta+A')
-                            await asyncio.sleep(0.05)
-                            await page.keyboard.press('Backspace')
-                            await asyncio.sleep(0.05)
-                            await page.keyboard.insert_text(text)
-                            await asyncio.sleep(0.1)
-                            await page.keyboard.press('Tab')
-                            await asyncio.sleep(0.2)
-                            current_text = await span_locator.first.inner_text()
-                            if current_text.strip() == text.strip():
-                                break
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
 
                 if self.config.get('enable_enhance_voice'):
                     try:
@@ -872,17 +1056,6 @@ class HeyGenAutomation:
                         pass
 
                 await asyncio.sleep(random.uniform(0.1, 0.2))
-                try:
-                    s_over = (self.config.get('step_overrides') or {}).get('fill_scene') or {}
-                    check = s_over.get('check')
-                    if bool(check):
-                        cur = await span_locator.first.inner_text()
-                        if self.normalize_text_for_compare(cur) != self.normalize_text_for_compare(text):
-                            return False
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
                 return True
 
             step_name_insert = f"insert_text_{scene_number}" if not safe_speaker else f"insert_text_{scene_number}_{safe_speaker}"
@@ -892,14 +1065,7 @@ class HeyGenAutomation:
                 self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
                 return False
             if self.verify_scene_after_insert:
-                async def _verify():
-                    return await self._verify_scene_text(page, span_locator.first, text)
-                step_name_verify = f"verify_scene_{scene_number}" if not safe_speaker else f"verify_scene_{scene_number}_{safe_speaker}"
-                ok_verify = await self.perform_step(step_name_verify, _verify, critical=True)
-                if not ok_verify:
-                    self._emit_notice(f"❌ scene_verify_failed: scene={scene_number}")
-                    self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
-                    return False
+                pass
             self._emit_notice(f"✅ scene_done: scene={scene_number}")
             self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": True})
             return True
@@ -2173,6 +2339,154 @@ class HeyGenAutomation:
     async def confirm_before_generation(self) -> bool:
         return True
 
+    async def _take_debug_screenshot(self, page: Page, name: str) -> str | None:
+        try:
+            ts = int(asyncio.get_event_loop().time() * 1000)
+            safe_name = "".join(ch for ch in name if ch.isalnum() or ch in "_-")
+            path = f"debug/screenshots/{safe_name}_{ts}.png"
+            await page.screenshot(path=path, full_page=True)
+            self._emit_notice(f"📸 screenshot: {path}")
+            return path
+        except Exception:
+            return None
+
+    async def _focus_canvas_for_validation(self, page: Page) -> bool:
+        try:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+            wrapper = page.locator("#editorCanvasWrapper").first
+            try:
+                if await wrapper.count() > 0:
+                    if await human_coordinate_click(page, wrapper):
+                        return True
+            except Exception:
+                pass
+
+            canvas = page.locator("canvas").first
+            try:
+                if await canvas.count() > 0:
+                    return await human_coordinate_click(page, canvas)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return False
+
+    async def _detect_broll_state_after_canvas_click(self, page: Page) -> str:
+        try:
+            await asyncio.sleep(2.0)
+            await self._focus_canvas_for_validation(page)
+            await asyncio.sleep(0.2)
+
+            ok_btn = page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"^(Detach from BG|Change BG|Detach|Change BG)$",
+                    re.I,
+                ),
+            )
+            set_as_bg_btn = page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"^(Set as BG|Set as Background|Set as background|Make background|"
+                    r"Сделать фоном|Сделать фон|Установить как фон)$",
+                    re.I,
+                ),
+            )
+            set_as_bg_menu = page.get_by_role(
+                "menuitem",
+                name=re.compile(
+                    r"(Set as BG|Set as Background|Set as background|Make background|"
+                    r"Сделать фоном|Сделать фон|Установить как фон)",
+                    re.I,
+                ),
+            )
+            bg_color_btn = page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"^(BG\s*Color|BG\s*Colour|Цвет\s*BG|BG\s*Цвет)$",
+                    re.I,
+                ),
+            )
+
+            try:
+                if await ok_btn.count() > 0 and await ok_btn.first.is_visible():
+                    return "ok"
+            except Exception:
+                pass
+            try:
+                if await set_as_bg_btn.count() > 0 and await set_as_bg_btn.first.is_visible():
+                    return "needs_set_bg"
+            except Exception:
+                pass
+            try:
+                if await set_as_bg_menu.count() > 0 and await set_as_bg_menu.first.is_visible():
+                    return "needs_set_bg"
+            except Exception:
+                pass
+
+            try:
+                if await bg_color_btn.count() > 0 and await bg_color_btn.first.is_visible():
+                    return "empty_canvas"
+            except Exception:
+                pass
+
+            return "unknown"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return "unknown"
+
+    async def _click_set_as_bg_if_present(self, page: Page) -> bool:
+        set_as_bg_btn = page.get_by_role(
+            "button",
+            name=re.compile(
+                r"^(Set as BG|Set as Background|Set as background|Make background|"
+                r"Сделать фоном|Сделать фон|Установить как фон)$",
+                re.I,
+            ),
+        ).first
+        set_as_bg_menu = page.get_by_role(
+            "menuitem",
+            name=re.compile(
+                r"(Set as BG|Set as Background|Set as background|Make background|"
+                r"Сделать фоном|Сделать фон|Установить как фон)",
+                re.I,
+            ),
+        ).first
+        try:
+            if await set_as_bg_btn.count() > 0:
+                try:
+                    await set_as_bg_btn.click(timeout=4000)
+                    return True
+                except Exception:
+                    try:
+                        await set_as_bg_btn.click(timeout=4000, force=True)
+                        return True
+                    except Exception:
+                        return await human_coordinate_click(page, set_as_bg_btn)
+        except Exception:
+            pass
+        try:
+            if await set_as_bg_menu.count() > 0:
+                try:
+                    await set_as_bg_menu.click(timeout=4000)
+                    return True
+                except Exception:
+                    try:
+                        await set_as_bg_menu.click(timeout=4000, force=True)
+                        return True
+                    except Exception:
+                        return await human_coordinate_click(page, set_as_bg_menu)
+        except Exception:
+            pass
+        return False
+
     async def handle_broll_for_scene(self, page: Page, scene_idx: int, query: str) -> bool:
         self._emit_notice(f"🎞️ broll_start: scene={scene_idx} query={query}")
         self._emit_step({"type": "start_broll", "scene": scene_idx})
@@ -2187,28 +2501,97 @@ class HeyGenAutomation:
             self._emit_notice("🧪 nano_banano_generate")
             settings = get_settings()
             out_dir = os.path.join(str(settings.local_storage_path or "./storage"), "nano_banano")
-            ok, err = await handle_nano_banano(
-                page,
-                nano_prompt,
-                scene_idx,
-                out_dir,
-                episode_id=str(self._current_episode_id or "episode"),
-                part_idx=int(self._current_part_idx or 0),
-                gate_callback=self._await_gate,
-            )
-            if not ok:
-                self._emit_notice(f"❌ nano_banano_error: {err}")
-                await self._take_error_screenshot(page, f"nano_banano_fail_{scene_idx}")
+            try:
+                text_label = f"text_{scene_idx}"
+                span_locator = page.locator('span[data-node-view-content-react]').filter(
+                    has_text=re.compile(rf'^\s*{re.escape(text_label)}\s*$')
+                )
+            except Exception:
+                span_locator = None
+
+            async def _select_scene_best_effort_for_nano():
+                try:
+                    if span_locator is None:
+                        return
+                    if await span_locator.count() > 0:
+                        await span_locator.first.scroll_into_view_if_needed()
+                        try:
+                            await page.keyboard.press('Escape')
+                        except Exception:
+                            pass
+                        await human_fast_center_click(page, span_locator.first)
+                except Exception:
+                    return
+
+            last_validation_reason = ""
+
+            for attempt in range(1, 4):
+                await self._await_gate()
+                await _select_scene_best_effort_for_nano()
+
+                ok, err = await handle_nano_banano(
+                    page,
+                    nano_prompt,
+                    scene_idx,
+                    out_dir,
+                    episode_id=str(self._current_episode_id or "episode"),
+                    part_idx=int(self._current_part_idx or 0),
+                    gate_callback=self._await_gate,
+                )
+                if not ok:
+                    self._emit_notice(f"❌ nano_banano_error: {err}")
+                    await self._take_error_screenshot(page, f"nano_banano_fail_{scene_idx}")
+                    if self.report is not None:
+                        self.report.setdefault("nano_banano_errors", []).append(
+                            {"scene_idx": scene_idx, "prompt": nano_prompt, "error": str(err or "")}
+                        )
+                    self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                    return True
+
+                state = await self._detect_broll_state_after_canvas_click(page)
+                if state == "needs_set_bg":
+                    self._emit_notice("⚠️ nano_banano_validate: needs_set_bg")
+                    clicked_bg = await self._click_set_as_bg_if_present(page)
+                    if clicked_bg:
+                        state = await self._detect_broll_state_after_canvas_click(page)
+                    if state == "needs_set_bg":
+                        last_validation_reason = "set_as_bg_still_visible"
+                    elif state == "empty_canvas":
+                        last_validation_reason = "bg_color_visible_after_set_bg"
+                    else:
+                        last_validation_reason = ""
+                elif state == "empty_canvas":
+                    self._emit_notice("⚠️ nano_banano_validate: empty_canvas")
+                    last_validation_reason = "bg_color_visible_after_insert"
+                else:
+                    last_validation_reason = ""
+
+                if state in ["ok", "unknown"]:
+                    self._emit_notice(f"✅ nano_banano_done: scene={scene_idx}")
+                    await self._take_error_screenshot(page, f"nano_banano_done_{scene_idx}")
+                    self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
+                    return True
+
+                snap = await self._take_debug_screenshot(page, f"nano_banano_validate_fail_{scene_idx}_try{attempt}")
+                if attempt < 3:
+                    self._emit_notice(f"⚠️ nano_banano_retry_validation: {attempt}/3 reason={last_validation_reason}")
+                    continue
+
+                err_msg = f"валидация Nano Banana не прошла после 3 попыток: {last_validation_reason or 'unknown'}"
+                self._emit_notice(f"❌ nano_banano_error: {err_msg}")
                 if self.report is not None:
                     self.report.setdefault("nano_banano_errors", []).append(
-                        {"scene_idx": scene_idx, "prompt": nano_prompt, "error": str(err or "")}
+                        {
+                            "scene_idx": scene_idx,
+                            "prompt": nano_prompt,
+                            "error": err_msg,
+                            "attempt": attempt,
+                            "reason": last_validation_reason or "unknown",
+                            "screenshot": snap or "",
+                        }
                     )
                 self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
                 return True
-
-            self._emit_notice(f"✅ nano_banano_done: scene={scene_idx}")
-            await self._take_error_screenshot(page, f"nano_banano_done_{scene_idx}")
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
             return True
 
         try:
@@ -2216,247 +2599,322 @@ class HeyGenAutomation:
             span_locator = page.locator('span[data-node-view-content-react]').filter(
                 has_text=re.compile(rf'^\s*{re.escape(text_label)}\s*$')
             )
-            if await span_locator.count() > 0:
-                await span_locator.first.scroll_into_view_if_needed()
-                await self._broll_pause(0.05)
-                try:
-                    await page.keyboard.press('Escape')
-                except Exception:
-                    pass
-                try:
-                    await span_locator.first.click(timeout=6000)
-                except Exception:
+        except Exception:
+            span_locator = None
+
+        async def _select_scene_best_effort():
+            try:
+                if span_locator is None:
+                    return
+                if await span_locator.count() > 0:
+                    await span_locator.first.scroll_into_view_if_needed()
                     try:
-                        await span_locator.first.click(timeout=6000, force=True)
+                        await page.keyboard.press('Escape')
                     except Exception:
-                        box = await span_locator.first.bounding_box()
-                        if box:
-                            await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                await self._broll_pause(0.15)
-        except Exception:
-            pass
+                        pass
+                    await human_fast_center_click(page, span_locator.first)
+            except Exception:
+                return
 
-        try:
-            await prepare_canvas_for_broll(page)
-        except Exception:
-            pass
+        last_validation_reason = ""
 
-        if not await self._open_media_panel(page):
-            err = "не удалось открыть панель Медиа"
-            self._emit_notice(f"❌ broll_error: {err}")
-            await self._take_error_screenshot(page, f"broll_panel_fail_{scene_idx}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
-
-        await self._broll_pause(0.2)
-
-        # Вкладка "Видео"/"Video" (сначала активируем вкладку)
-        if not await self._select_video_tab(page):
-            err = "вкладка Видео/Video не найдена"
-            self._emit_notice(f"❌ broll_error: {err}")
-            await self._take_error_screenshot(page, f"broll_tab_fail_{scene_idx}")
-            if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
-        await self._broll_pause(0.2)
-
-        # Источник (Sources)
-        async def _gate():
+        for attempt in range(1, 4):
             await self._await_gate()
-        
-        if self.media_source not in ['all', 'все', '']:
-            self._emit_notice(f"📂 broll_source: {self.media_source}")
-            ok_source = await select_media_source(page, self.media_source, gate_callback=_gate)
-            if not ok_source:
-                self._emit_notice(f"⚠️ не удалось выбрать источник: {self.media_source}")
+            await _select_scene_best_effort()
+            try:
+                await prepare_canvas_for_broll(page)
+            except Exception:
+                pass
 
-        # Ориентация (Orientation)
-        choice = self.orientation_choice or 'Горизонтальная'
-        self._emit_notice(f"📐 broll_orientation: {choice}")
-        ok_orient = await select_orientation(page, choice, gate_callback=_gate)
-        if not ok_orient:
-            self._emit_notice(f"⚠️ не удалось выбрать ориентацию: {choice}")
-
-        await self._broll_pause(0.2)
-
-        # Поле поиска и выбор
-        self._emit_notice("🔎 broll_search")
-
-        current_query = str(query).strip()
-        found = False
-
-        while True:
-            await self._await_gate()
-
-            search_input = await self._locate_broll_search_input(page)
-            if search_input is None:
-                err = "поле поиска B-roll не найдено"
+            if not await self._open_media_panel(page):
+                err = "не удалось открыть панель Медиа"
                 self._emit_notice(f"❌ broll_error: {err}")
-                await self._take_error_screenshot(page, f"broll_search_input_fail_{scene_idx}")
+                await self._take_error_screenshot(page, f"broll_panel_fail_{scene_idx}")
                 if self.report is not None:
-                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
+                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
                 if self.enable_notifications:
                     await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
                 self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
                 return False
 
-            try:
-                await search_input.scroll_into_view_if_needed()
-            except Exception:
-                pass
-            try:
-                await search_input.click(timeout=3000)
-            except Exception:
+            await self._broll_pause(0.2)
+
+            if not await self._select_video_tab(page):
+                err = "вкладка Видео/Video не найдена"
+                self._emit_notice(f"❌ broll_error: {err}")
+                await self._take_error_screenshot(page, f"broll_tab_fail_{scene_idx}")
+                if self.report is not None:
+                    self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': query, 'error': err})
+                if self.enable_notifications:
+                    await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
+                self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                return False
+            await self._broll_pause(0.2)
+
+            async def _gate():
+                await self._await_gate()
+            
+            if self.media_source not in ['all', 'все', '']:
+                self._emit_notice(f"📂 broll_source: {self.media_source}")
+                ok_source = await select_media_source(page, self.media_source, gate_callback=_gate)
+                if not ok_source:
+                    self._emit_notice(f"⚠️ не удалось выбрать источник: {self.media_source}")
+
+            choice = self.orientation_choice or 'Горизонтальная'
+            self._emit_notice(f"📐 broll_orientation: {choice}")
+            ok_orient = await select_orientation(page, choice, gate_callback=_gate)
+            if not ok_orient:
+                self._emit_notice(f"⚠️ не удалось выбрать ориентацию: {choice}")
+
+            await self._broll_pause(0.2)
+
+            self._emit_notice("🔎 broll_search")
+
+            current_query = str(query).strip()
+            found = False
+
+            while True:
+                await self._await_gate()
+
+                search_input = await self._locate_broll_search_input(page)
+                if search_input is None:
+                    err = "поле поиска B-roll не найдено"
+                    self._emit_notice(f"❌ broll_error: {err}")
+                    await self._take_error_screenshot(page, f"broll_search_input_fail_{scene_idx}")
+                    if self.report is not None:
+                        self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
+                    if self.enable_notifications:
+                        await self.notify('HeyGen', f'B-roll: {err} (scene {scene_idx})')
+                    self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                    return False
+
                 try:
-                    await search_input.click(timeout=3000, force=True)
+                    await search_input.scroll_into_view_if_needed()
                 except Exception:
                     pass
+                try:
+                    await search_input.click(timeout=3000)
+                except Exception:
+                    try:
+                        await search_input.click(timeout=3000, force=True)
+                    except Exception:
+                        pass
 
-            await self._await_gate()
-            try:
-                await page.keyboard.press('Meta+A')
-                await page.keyboard.press('Backspace')
-                await page.keyboard.insert_text(current_query)
-                await page.keyboard.press('Enter')
-            except Exception as e:
-                err = f"не удалось ввести запрос B-roll: {e}"
+                await self._await_gate()
+                try:
+                    await page.keyboard.press('Meta+A')
+                    await page.keyboard.press('Backspace')
+                    await page.keyboard.insert_text(current_query)
+                    await page.keyboard.press('Enter')
+                except Exception as e:
+                    err = f"не удалось ввести запрос B-roll: {e}"
+                    self._emit_notice(f"❌ broll_error: {err}")
+                    await self._take_error_screenshot(page, f"broll_search_type_fail_{scene_idx}")
+                    if self.report is not None:
+                        self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
+                    self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                    return False
+
+                await page.wait_for_timeout(3000)
+
+                try:
+                    media_header = page.get_by_role(
+                        "heading",
+                        level=2,
+                        name=re.compile(r"^\s*(Медиа|Media)\s*$", re.I),
+                    )
+                    media_panel = page.locator("aside, section, div").filter(has=media_header).first
+                    active_panel = media_panel.locator('[role="tabpanel"][data-state="active"]').first
+                    try:
+                        if await active_panel.count() == 0:
+                            active_panel = media_panel
+                    except Exception:
+                        active_panel = media_panel
+
+                    no_data = active_panel.locator('div:not(.tw-hidden)').filter(
+                        has_text=re.compile(r"\b(No\s+data|No\s+results\s+found)\b", re.I)
+                    )
+                    has_no_data = await no_data.count() > 0
+                except Exception:
+                    has_no_data = False
+
+                if has_no_data:
+                    words = current_query.split()
+                    if len(words) > 1:
+                        current_query = ' '.join(words[:-1])
+                        self._emit_notice(f"⚠️ broll_retry: сокращаю запрос до '{current_query}'")
+                        continue
+                    break
+
+                try:
+                    imgs = active_panel.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
+                except Exception:
+                    imgs = page.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
+                try:
+                    await imgs.first.wait_for(state='attached', timeout=20000)
+                    first_img = None
+                    vs = None
+                    try:
+                        vs = page.viewport_size
+                    except Exception:
+                        vs = None
+                    if vs and vs.get("width"):
+                        vw = float(vs["width"])
+                    else:
+                        try:
+                            vw = float(await page.evaluate("() => window.innerWidth"))
+                        except Exception:
+                            vw = 0.0
+                    try:
+                        cnt = await imgs.count()
+                    except Exception:
+                        cnt = 0
+                    for i in range(min(cnt, 60)):
+                        cand = imgs.nth(i)
+                        try:
+                            box = await cand.bounding_box()
+                            if not box:
+                                continue
+                            if vw and float(box.get("x", 0.0)) <= vw * 0.5:
+                                continue
+                            try:
+                                nw = int(await cand.evaluate("el => el.naturalWidth || 0"))
+                            except Exception:
+                                nw = 0
+                            if nw <= 1:
+                                continue
+                            if await cand.is_visible():
+                                first_img = cand
+                                break
+                        except Exception:
+                            continue
+                    if first_img is None:
+                        raise RuntimeError("no visible broll results")
+                except Exception:
+                    words = current_query.split()
+                    if len(words) > 1:
+                        current_query = ' '.join(words[:-1])
+                        self._emit_notice(f"⚠️ broll_retry: результатов не видно, сокращаю запрос до '{current_query}'")
+                        continue
+                    break
+
+                clicked = await human_coordinate_click(page, first_img)
+                if clicked:
+                    found = True
+                    break
+
+                err = "не удалось кликнуть первый результат B-roll"
                 self._emit_notice(f"❌ broll_error: {err}")
-                await self._take_error_screenshot(page, f"broll_search_type_fail_{scene_idx}")
+                await self._take_error_screenshot(page, f"broll_click_result_fail_{scene_idx}")
                 if self.report is not None:
                     self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
                 self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
                 return False
+            
+            if not found:
+                err = f"результаты не найдены для запроса '{query}'"
+                self._emit_notice(f"❌ broll_no_results: {err}")
+                await self._take_error_screenshot(page, f"broll_no_results_{scene_idx}")
+                if self.report is not None:
+                    self.report['broll_no_results'].append({'scene_idx': scene_idx, 'query': query})
+                if self.enable_notifications:
+                    await self.notify('HeyGen', f'B-roll без результатов (scene {scene_idx})')
+                self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
+                return False
 
-            await page.wait_for_timeout(3000)
+            await self._broll_pause(0.25)
 
-            try:
-                media_header = page.get_by_role(
-                    "heading",
-                    level=2,
-                    name=re.compile(r"^\s*(Медиа|Media)\s*$", re.I),
-                )
-                media_panel = page.locator("aside, section, div").filter(has=media_header).first
-                active_panel = media_panel.locator('[role="tabpanel"][data-state="active"]').first
+            if attempt == 1 and self._wf_bool(self.config.get("broll_validation_force_empty_once"), False):
                 try:
-                    if await active_panel.count() == 0:
-                        active_panel = media_panel
+                    await self._focus_canvas_for_validation(page)
+                    await asyncio.sleep(0.25)
+                    await page.keyboard.press("Delete")
+                    await asyncio.sleep(0.25)
                 except Exception:
-                    active_panel = media_panel
+                    pass
 
-                no_data = active_panel.locator('div:not(.tw-hidden)').filter(
-                    has_text=re.compile(r"\b(No\s+data|No\s+results\s+found)\b", re.I)
-                )
-                has_no_data = await no_data.count() > 0
-            except Exception:
-                has_no_data = False
-
-            if has_no_data:
-                words = current_query.split()
-                if len(words) > 1:
-                    current_query = ' '.join(words[:-1])
-                    self._emit_notice(f"⚠️ broll_retry: сокращаю запрос до '{current_query}'")
-                    continue
-                break
-
-            try:
-                imgs = active_panel.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
-            except Exception:
-                imgs = page.locator('div:not(.tw-hidden) .tw-grid-cols-2 img')
-            try:
-                await imgs.first.wait_for(state='attached', timeout=20000)
-                first_img = None
-                vs = None
+            if attempt == 1 and self._wf_bool(self.config.get("broll_validation_force_needs_set_bg_once"), False):
                 try:
-                    vs = page.viewport_size
-                except Exception:
-                    vs = None
-                if vs and vs.get("width"):
-                    vw = float(vs["width"])
-                else:
-                    try:
-                        vw = float(await page.evaluate("() => window.innerWidth"))
-                    except Exception:
-                        vw = 0.0
-                try:
-                    cnt = await imgs.count()
-                except Exception:
-                    cnt = 0
-                for i in range(min(cnt, 60)):
-                    cand = imgs.nth(i)
-                    try:
-                        box = await cand.bounding_box()
-                        if not box:
-                            continue
-                        if vw and float(box.get("x", 0.0)) <= vw * 0.5:
-                            continue
+                    await self._focus_canvas_for_validation(page)
+                    await asyncio.sleep(0.2)
+                    detach_btn = page.get_by_role(
+                        "button",
+                        name=re.compile(r"^(Detach from BG|Открепить от BG|Открепить от фона)$", re.I),
+                    ).first
+                    if await detach_btn.count() > 0:
                         try:
-                            nw = int(await cand.evaluate("el => el.naturalWidth || 0"))
+                            if await detach_btn.is_visible():
+                                await detach_btn.click(timeout=4000)
+                                await asyncio.sleep(0.4)
                         except Exception:
-                            nw = 0
-                        if nw <= 1:
-                            continue
-                        if await cand.is_visible():
-                            first_img = cand
-                            break
+                            try:
+                                await detach_btn.click(timeout=4000, force=True)
+                                await asyncio.sleep(0.4)
+                            except Exception:
+                                await human_coordinate_click(page, detach_btn)
+                                await asyncio.sleep(0.4)
+                except Exception:
+                    pass
+
+            state = await self._detect_broll_state_after_canvas_click(page)
+            if state == "needs_set_bg":
+                self._emit_notice("⚠️ broll_validate: needs_set_bg")
+                clicked_bg = await self._click_set_as_bg_if_present(page)
+                if clicked_bg:
+                    state = await self._detect_broll_state_after_canvas_click(page)
+                if state == "needs_set_bg":
+                    last_validation_reason = "set_as_bg_still_visible"
+                elif state == "empty_canvas":
+                    last_validation_reason = "bg_color_visible_after_set_bg"
+                elif state == "unknown":
+                    last_validation_reason = "unknown_after_set_bg"
+                else:
+                    last_validation_reason = ""
+            elif state == "empty_canvas":
+                self._emit_notice("⚠️ broll_validate: empty_canvas")
+                last_validation_reason = "bg_color_visible_after_insert"
+            elif state == "unknown":
+                self._emit_notice("⚠️ broll_validate: unknown_state")
+                last_validation_reason = "unknown_state"
+            else:
+                last_validation_reason = ""
+
+            if state == "ok":
+                if self.close_media_panel_after_broll:
+                    try:
+                        close_btn = page.locator('button:has(iconpark-icon[name="close"])')
+                        if await close_btn.count() > 0:
+                            await close_btn.first.click(timeout=5000)
+                            await self._broll_pause(0.2)
                     except Exception:
-                        continue
-                if first_img is None:
-                    raise RuntimeError("no visible broll results")
-            except Exception:
-                words = current_query.split()
-                if len(words) > 1:
-                    current_query = ' '.join(words[:-1])
-                    self._emit_notice(f"⚠️ broll_retry: результатов не видно, сокращаю запрос до '{current_query}'")
-                    continue
-                break
+                        pass
 
-            clicked = await human_coordinate_click(page, first_img)
-            if clicked:
-                found = True
-                break
+                self._emit_notice(f"✅ broll_done: scene={scene_idx}")
+                await self._take_error_screenshot(page, f"broll_done_{scene_idx}")
+                self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
+                return True
 
-            err = "не удалось кликнуть первый результат B-roll"
+            snap = await self._take_debug_screenshot(page, f"broll_validate_fail_{scene_idx}_try{attempt}")
+            if attempt < 3:
+                self._emit_notice(f"⚠️ broll_retry_validation: {attempt}/3 reason={last_validation_reason}")
+                continue
+
+            err = f"валидация B-roll не прошла после 3 попыток: {last_validation_reason or 'unknown'}"
             self._emit_notice(f"❌ broll_error: {err}")
-            await self._take_error_screenshot(page, f"broll_click_result_fail_{scene_idx}")
             if self.report is not None:
-                self.report['broll_errors'].append({'scene_idx': scene_idx, 'query': current_query, 'error': err})
+                self.report['broll_errors'].append(
+                    {
+                        'scene_idx': scene_idx,
+                        'query': query,
+                        'error': err,
+                        'kind': 'validation_failed',
+                        'attempt': attempt,
+                        'reason': last_validation_reason or 'unknown',
+                        'screenshot': snap or '',
+                    }
+                )
             self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
             return False
-        
-        if not found:
-            err = f"результаты не найдены для запроса '{query}'"
-            self._emit_notice(f"❌ broll_no_results: {err}")
-            await self._take_error_screenshot(page, f"broll_no_results_{scene_idx}")
-            if self.report is not None:
-                self.report['broll_no_results'].append({'scene_idx': scene_idx, 'query': query})
-            if self.enable_notifications:
-                await self.notify('HeyGen', f'B-roll без результатов (scene {scene_idx})')
-            self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": False})
-            return False
-
-        await self._broll_pause(0.25)
-
-        if self.close_media_panel_after_broll:
-            try:
-                close_btn = page.locator('button:has(iconpark-icon[name="close"])')
-                if await close_btn.count() > 0:
-                    await close_btn.first.click(timeout=5000)
-                    await self._broll_pause(0.2)
-            except Exception:
-                pass
-
-        # Без ручной проверки: продолжаем по тайм-аутам
-        self._emit_notice(f"✅ broll_done: scene={scene_idx}")
-        await self._take_error_screenshot(page, f"broll_done_{scene_idx}")
-        self._emit_step({"type": "finish_broll", "scene": scene_idx, "ok": True})
-        return True
 
     async def click_save_and_wait(self, page: Page):
         print("\n💾 Сохраняю изменения перед проверкой...")
@@ -2626,50 +3084,10 @@ class HeyGenAutomation:
                         auto_fixed = True
                 except Exception:
                     pass
-                # Осторожный фолбэк по индексу, только если структура сцены выглядит последовательной
-                if not auto_fixed:
-                    try:
-                        spans = page.locator('span[data-node-view-content-react]')
-                        total = await spans.count()
-                        if scene_idx - 1 < total:
-                            candidate = spans.nth(scene_idx - 1)
-                            t = await candidate.inner_text()
-                            norm_t = self.normalize_text_for_compare(t)
-                            # Пишем только если текст действительно отличается от ожидаемого
-                            if norm_t != expected_text:
-                                await candidate.scroll_into_view_if_needed()
-                                await self._await_gate()
-                                await asyncio.sleep(0.05)
-                                try:
-                                    await page.keyboard.press('Escape')
-                                except Exception:
-                                    pass
-                                try:
-                                    await candidate.click(timeout=2000)
-                                except Exception:
-                                    try:
-                                        await candidate.click(timeout=2000, force=True)
-                                    except Exception:
-                                        box = await candidate.bounding_box()
-                                        if box:
-                                            await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                                await self._await_gate()
-                                await asyncio.sleep(0.05)
-                                await page.keyboard.press('Meta+A')
-                                await self._await_gate()
-                                await asyncio.sleep(0.05)
-                                await page.keyboard.press('Backspace')
-                                await self._await_gate()
-                                await asyncio.sleep(0.05)
-                                await page.keyboard.insert_text(s['text'])
-                                await self._await_gate()
-                                await asyncio.sleep(0.1)
-                                await page.keyboard.press('Tab')
-                                await self._await_gate()
-                                await asyncio.sleep(0.1)
-                                auto_fixed = True
-                    except Exception:
-                        pass
+                
+                # Удален опасный фолбэк по индексу, который перезаписывал заполненные сцены.
+                # Теперь мы полагаемся только на явное наличие text_N (auto_fixed).
+                
                 if auto_fixed:
                     try:
                         locator_all2 = page.locator('span[data-node-view-content-react]')

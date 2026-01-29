@@ -5,6 +5,7 @@ import time
 import subprocess
 import sys
 from urllib.parse import urlparse
+from html import escape as _html_escape
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi import Query
@@ -42,6 +43,8 @@ _global_pause.set()
 _sem = asyncio.Semaphore(int(getattr(runner, "max_concurrency", 2) or 2))
 _automation_refs: Dict[str, HeyGenAutomation] = {}
 _task_status: Dict[str, Dict[str, Any]] = {}
+_task_scene_done: Dict[str, set] = {}
+_global_scene_done: set = set()
 
 def _now_ts() -> int:
     try:
@@ -86,7 +89,7 @@ def _browser_launch_command(cfg: Dict[str, Any]) -> List[str]:
 
 def _is_browser_closed_error(msg: str) -> bool:
     text = str(msg or "")
-    return "Target page, context or browser has been closed" in text or "has been closed" in text
+    return "Target page, context or browser has been closed" in text or "has been closed" in text or "closed by user" in text
 
 def _task_key(episode: str, part: int) -> str:
     return f"{episode}::{int(part)}"
@@ -124,7 +127,7 @@ def _compact_report_entries(items: Any) -> List[Dict[str, Any]]:
     for it in items or []:
         if isinstance(it, dict):
             cur = {}
-            for k in ("scene_idx", "query", "error", "reason"):
+            for k in ("scene_idx", "query", "error", "reason", "kind", "prompt", "attempt", "screenshot"):
                 if it.get(k) is not None:
                     cur[k] = it.get(k)
             if cur:
@@ -190,6 +193,7 @@ def _format_task_report_line(report: Dict[str, Any]) -> str:
         "broll_no_results": "b-roll без результатов",
         "broll_errors": "ошибки b-roll",
         "manual_intervention": "вмешательство",
+        "nano_banano_errors": "ошибки Nano Banana",
     }
     parts = []
     for k, label in labels.items():
@@ -205,7 +209,7 @@ def _format_scene_errors(details: Optional[Dict[str, List[Dict[str, Any]]]]) -> 
     if not isinstance(details, dict):
         return ""
     scenes = set()
-    for key in ("validation_missing", "broll_errors", "broll_no_results", "broll_skipped"):
+    for key in ("validation_missing", "broll_errors", "broll_no_results", "broll_skipped", "nano_banano_errors", "manual_intervention"):
         items = details.get(key) or []
         for it in items:
             if isinstance(it, dict) and it.get("scene_idx") is not None:
@@ -215,6 +219,94 @@ def _format_scene_errors(details: Optional[Dict[str, List[Dict[str, Any]]]]) -> 
     ordered = sorted(scenes, key=lambda x: int(x) if str(x).isdigit() else x)
     return ", ".join(ordered)
 
+def _tg_escape(v: Any) -> str:
+    try:
+        return _html_escape(str(v or ""), quote=True)
+    except Exception:
+        return ""
+
+def _scene_idx_from_item(it: Any) -> Optional[int]:
+    if not isinstance(it, dict):
+        return None
+    v = it.get("scene_idx")
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+def _classify_broll_error(it: Dict[str, Any]) -> str:
+    kind = str(it.get("kind") or "").strip()
+    reason = str(it.get("reason") or "").strip()
+    err = str(it.get("error") or "").strip()
+
+    r = reason.lower()
+    e = err.lower()
+
+    if kind in ("validation_failed", "nano_validation_failed"):
+        if "set_as_bg" in r or "needs_set_bg" in r or "still_visible" in r:
+            return "бирол не установлен на фон"
+        if "bg_color_visible_after_insert" in r or "empty_canvas" in r:
+            return "не вставлен бирол"
+        if kind == "nano_validation_failed":
+            return "Nano Banana: валидация не прошла"
+        return "валидация B-roll не прошла"
+
+    if "панель" in e or "media" in e or "вкладка" in e or "video" in e:
+        return "не вставлен бирол"
+
+    return "ошибка b-roll"
+
+def _compute_scene_health(t: Dict[str, Any]) -> Dict[str, Any]:
+    details = t.get("report_details") if isinstance(t, dict) else None
+    if not isinstance(details, dict):
+        details = {}
+
+    errors_by_scene: Dict[int, List[str]] = {}
+
+    def add(scene_idx: int, label: str) -> None:
+        if scene_idx is None:
+            return
+        if scene_idx not in errors_by_scene:
+            errors_by_scene[scene_idx] = []
+        if label and label not in errors_by_scene[scene_idx]:
+            errors_by_scene[scene_idx].append(label)
+
+    for it in (details.get("validation_missing") or []):
+        idx = _scene_idx_from_item(it)
+        if idx is not None:
+            add(idx, "не заполнен текст сцены")
+
+    for it in (details.get("broll_no_results") or []):
+        idx = _scene_idx_from_item(it)
+        if idx is not None:
+            add(idx, "не вставлен бирол (нет результатов)")
+
+    for it in (details.get("nano_banano_errors") or []):
+        idx = _scene_idx_from_item(it)
+        if idx is not None:
+            add(idx, "нано банано не сгенерировало изображение")
+
+    for it in (details.get("broll_errors") or []):
+        idx = _scene_idx_from_item(it)
+        if idx is None:
+            continue
+        label = _classify_broll_error(it if isinstance(it, dict) else {})
+        add(idx, label)
+
+    total = 0
+    try:
+        total = int(t.get("scene_total") or 0)
+    except Exception:
+        total = 0
+    bad = sorted(errors_by_scene.keys())
+    ok = 0
+    if total > 0:
+        ok = max(total - len(bad), 0)
+    ratio = (ok / total) if total > 0 else 0.0
+    return {"scene_total": total, "scene_ok": ok, "ratio": ratio, "errors_by_scene": errors_by_scene}
+
 def _send_task_telegram(t: Dict[str, Any], report: Optional[Dict[str, Any]] = None) -> None:
     token, chat_id, broadcast_all = _telegram_config()
     if not token or (not chat_id and not broadcast_all):
@@ -223,27 +315,58 @@ def _send_task_telegram(t: Dict[str, Any], report: Optional[Dict[str, Any]] = No
         status = str(t.get("status") or "")
         episode = str(t.get("episode") or "")
         part = str(t.get("part") or "")
-        scenes = f"{int(t.get('scene_done') or 0)}/{int(t.get('scene_total') or 0)}"
+        health = _compute_scene_health(t)
+        scene_total = int(health.get("scene_total") or 0)
+        scene_ok = int(health.get("scene_ok") or 0)
+        ratio = float(health.get("ratio") or 0.0)
+        scenes = f"{scene_ok}/{scene_total}"
         project_url = str(t.get("template_url") or "").strip()
         project_status = str(t.get("project_status") or "").strip()
         speakers = t.get("speakers") if isinstance(t.get("speakers"), list) else []
         speakers_text = ", ".join([str(s) for s in speakers if str(s).strip()])
-        lines = [f"HeyGen: {episode} part {part}", f"Статус: {status}", f"Сцены: {scenes}"]
+
+        st = status.lower()
+        has_scene_errors = bool(health.get("errors_by_scene"))
+        early_fail = st in ("failed", "stopped") and (scene_total == 0 or scene_ok == 0)
+        if early_fail:
+            emoji = "❌"
+        elif scene_total > 0 and ratio < 0.8:
+            emoji = "❌"
+        elif has_scene_errors:
+            emoji = "⚠️"
+        elif st == "success":
+            emoji = "✅"
+        else:
+            emoji = "⚠️"
+
+        lines = [
+            f"Название эпизода: <b>{_tg_escape(episode)}</b>",
+            f"Часть: {_tg_escape(part)}",
+            f"Статус: {emoji} {_tg_escape(status)}",
+            f"Сцены: {_tg_escape(scenes)}",
+        ]
         if project_status:
-            lines.append(f"Проект: {project_status}")
+            lines.append(f"Проект: {_tg_escape(project_status)}")
         if project_url:
-            lines.append(f"Ссылка: {project_url}")
+            lines.append(f"Ссылка: {_tg_escape(project_url)}")
         if speakers_text:
-            lines.append(f"Спикеры: {speakers_text}")
+            lines.append(f"Спикеры: {_tg_escape(speakers_text)}")
         err = str(t.get("error") or "").strip()
         if err:
-            lines.append(f"Ошибка: {err}")
-        scene_errs = _format_scene_errors(t.get("report_details") if isinstance(t.get("report_details"), dict) else None)
-        if scene_errs:
-            lines.append(f"Ошибки в сценах: {scene_errs}")
+            lines.append(f"Ошибка: {_tg_escape(err)}")
+
+        if has_scene_errors:
+            lines.append("Ошибки:")
+            errors_by_scene = health.get("errors_by_scene") or {}
+            ordered = sorted([k for k in errors_by_scene.keys() if isinstance(k, int)])
+            for scene_idx in ordered:
+                reasons = errors_by_scene.get(scene_idx) or []
+                reasons_text = "; ".join([str(x) for x in reasons if str(x).strip()])
+                if reasons_text:
+                    lines.append(f"• Сцена {scene_idx}: {_tg_escape(reasons_text)}")
         rep_line = _format_task_report_line(report or {})
         if rep_line:
-            lines.append(f"Отчёт: {rep_line}")
+            lines.append(f"Отчёт: {_tg_escape(rep_line)}")
         text = "\n".join([l for l in lines if l])
         ok = False
         if broadcast_all:
@@ -438,6 +561,8 @@ def _on_notice(msg: str):
     if runner.cancel:
         return
     _log.append({"level": "info", "msg": msg})
+    if msg == "browser_closed_event":
+        asyncio.create_task(_stop_all_tasks("browser_closed_event"))
 
 def _on_progress(p):
     global _progress
@@ -456,11 +581,11 @@ def _on_step(s):
         ep = (s or {}).get("episode")
         part = (s or {}).get("part")
         if ep is not None and part is not None:
+            k = _task_key(str(ep), int(part))
             t = _ensure_task(str(ep), int(part))
             t["stage"] = st
             # Реалтайм TaskStatus: обновляем снапшот из живой автоматики
             try:
-                k = _task_key(str(ep), int(part))
                 auto = _automation_refs.get(k)
                 if auto is not None and getattr(auto, "task_status", None) is not None:
                     _task_status[k] = auto.task_status.model_dump()
@@ -471,6 +596,14 @@ def _on_step(s):
                 t["finished_at"] = None
                 t["error"] = ""
                 t["report"] = None
+                try:
+                    old = _task_scene_done.get(k) or set()
+                    for scene_idx in old:
+                        _global_scene_done.discard(f"{k}:{int(scene_idx)}")
+                except Exception:
+                    pass
+                _task_scene_done[k] = set()
+                t["scene_done"] = 0
                 _set_task_status(t, "running")
             elif st == "finish_part":
                 ok = bool((s or {}).get("ok"))
@@ -487,7 +620,19 @@ def _on_step(s):
             elif st == "finish_scene":
                 try:
                     if bool((s or {}).get("ok", True)):
-                        t["scene_done"] = int(t.get("scene_done") or 0) + 1
+                        raw_scene = (s or {}).get("scene")
+                        try:
+                            scene_idx = int(raw_scene)
+                        except Exception:
+                            scene_idx = None
+                        if scene_idx is not None:
+                            seen = _task_scene_done.get(k)
+                            if not isinstance(seen, set):
+                                seen = set()
+                                _task_scene_done[k] = seen
+                            if scene_idx not in seen:
+                                seen.add(scene_idx)
+                                t["scene_done"] = len(seen)
                 except Exception:
                     pass
             elif st == "start_broll":
@@ -504,7 +649,19 @@ def _on_step(s):
         if st == "finish_part":
             _progress["done_parts"] = int(_progress.get("done_parts") or 0) + 1
         if st == "finish_scene":
-            _progress["done_scenes"] = int(_progress.get("done_scenes") or 0) + 1
+            ep = (s or {}).get("episode")
+            part = (s or {}).get("part")
+            raw_scene = (s or {}).get("scene")
+            if ep is not None and part is not None and raw_scene is not None:
+                try:
+                    k = _task_key(str(ep), int(part))
+                    scene_idx = int(raw_scene)
+                    gk = f"{k}:{scene_idx}"
+                    if gk not in _global_scene_done and bool((s or {}).get("ok", True)):
+                        _global_scene_done.add(gk)
+                        _progress["done_scenes"] = int(_progress.get("done_scenes") or 0) + 1
+                except Exception:
+                    pass
         total_scenes = int(_progress.get("total_scenes") or 0)
         total_parts = int(_progress.get("total_parts") or 0)
         if total_scenes > 0:
@@ -583,7 +740,7 @@ async def _run_one(ep: str, part: int) -> bool:
             _set_task_status(tinfo, "failed")
             tinfo["error"] = str(e)
             if _is_browser_closed_error(str(e)):
-                _stop_all_tasks("browser_closed")
+                await _stop_all_tasks("browser_closed")
         if not ok and not str(tinfo.get("error") or ""):
             try:
                 last_err = str(getattr(auto, "_last_error", "") or "")
@@ -607,6 +764,7 @@ async def _run_one(ep: str, part: int) -> bool:
                     "broll_no_results": len(rep.get("broll_no_results") or []),
                     "broll_errors": len(rep.get("broll_errors") or []),
                     "manual_intervention": len(rep.get("manual_intervention") or []),
+                    "nano_banano_errors": len(rep.get("nano_banano_errors") or []),
                 }
             except Exception:
                 rep_summary = None
@@ -617,6 +775,7 @@ async def _run_one(ep: str, part: int) -> bool:
                     "broll_no_results": _compact_report_entries(rep.get("broll_no_results")),
                     "broll_errors": _compact_report_entries(rep.get("broll_errors")),
                     "manual_intervention": _compact_report_entries(rep.get("manual_intervention")),
+                    "nano_banano_errors": _compact_report_entries(rep.get("nano_banano_errors")),
                 }
             except Exception:
                 pass
@@ -659,12 +818,26 @@ def _start_task(ep: str, part: int) -> None:
             _active_tasks.pop(key, None)
     _active_tasks[key] = asyncio.create_task(_go())
 
-def _stop_all_tasks(reason: str) -> None:
+async def _stop_all_tasks(reason: str) -> None:
     global _progress
     global _log
+    global _task_scene_done
+    global _global_scene_done
     runner.stop()
+    # Close browser on stop
+    try:
+        if runner.automation:
+            await runner.automation.close_browser()
+    except Exception:
+        pass
+
     try:
         _progress = {"done": 0, "total": 0, "done_parts": 0, "total_parts": 0, "done_scenes": 0, "total_scenes": 0}
+    except Exception:
+        pass
+    try:
+        _task_scene_done = {}
+        _global_scene_done = set()
     except Exception:
         pass
     try:
@@ -917,8 +1090,8 @@ async def api_run_projects(payload: Dict[str, Any]):
     return {"ok": True, "total": len(episodes)}
 
 @app.post("/stop")
-def api_stop():
-    _stop_all_tasks("stopped")
+async def api_stop():
+    await _stop_all_tasks("stopped")
     return {"ok": True}
 
 @app.post("/pause")
@@ -972,6 +1145,11 @@ async def api_run_workflow(payload: Dict[str, Any]):
     workflow = (payload or {}).get("workflow")
     if not episode or part is None:
         raise HTTPException(status_code=400, detail="episode and part required")
+    runner.cancel = False
+    try:
+        _global_pause.set()
+    except Exception:
+        pass
     try:
         _apply_workflow_settings(str(workflow or "") or None)
     except Exception:

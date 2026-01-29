@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional, Callable, Awaitable, List, Dict, Any
 from ui.logger import logger
 from utils.helpers import normalize_speaker_key, normalize_text_for_compare
 from core.browser import safe_click, read_locator_text, fast_replace_text
+from core.browser import human_fast_center_click
 
 if TYPE_CHECKING:
     from playwright.async_api import Page, Locator
@@ -84,24 +85,9 @@ async def select_scene(
     except Exception:
         pass
     
-    # Try different click strategies
-    try:
-        await locator.click(timeout=3000)
-    except Exception:
-        try:
-            await locator.click(timeout=3000, force=True)
-        except Exception:
-            try:
-                box = await locator.bounding_box()
-                if box:
-                    await page.mouse.click(
-                        box['x'] + box['width'] / 2,
-                        box['y'] + box['height'] / 2,
-                    )
-                    return True
-            except Exception:
-                return False
-            return False
+    ok = await human_fast_center_click(page, locator)
+    if not ok:
+        return False
     
     if gate_callback:
         await gate_callback()

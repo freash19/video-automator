@@ -233,6 +233,7 @@ async def human_coordinate_click(page: "Page", locator: "Locator") -> bool:
         except Exception:
             pass
 
+        # Recalculate box right before interaction
         box = await locator.bounding_box()
         if not box:
             return False
@@ -241,14 +242,41 @@ async def human_coordinate_click(page: "Page", locator: "Locator") -> bool:
         y = box["y"] + box["height"] * 0.5
 
         await _show_click_marker(page, x, y)
+        
+        # Move and click (single action)
         await page.mouse.move(x, y)
+        await asyncio.sleep(0.05) # Small human-like delay
         await page.mouse.down()
+        await asyncio.sleep(0.05) # Quick click
+        await page.mouse.up()
+        
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def human_fast_center_click(page: "Page", locator: "Locator") -> bool:
+    try:
         try:
-            await locator.focus()
+            await locator.scroll_into_view_if_needed()
         except Exception:
             pass
-        await asyncio.sleep(0.15)
-        await page.mouse.up()
+        try:
+            await locator.wait_for(state="visible", timeout=3000)
+        except Exception:
+            pass
+        box = await locator.bounding_box()
+        if not box:
+            try:
+                await locator.click(timeout=3000, force=True)
+                return True
+            except Exception:
+                return False
+        x = box["x"] + box["width"] * 0.5
+        y = box["y"] + box["height"] * 0.5
+        await page.mouse.move(x, y)
         await page.mouse.click(x, y)
         return True
     except asyncio.CancelledError:

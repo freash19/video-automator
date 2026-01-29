@@ -30,7 +30,14 @@ def parse_nano_banano_prompt(query: str) -> Optional[str]:
         The prompt text after the prefix, or None if not a Nano Banano query
     """
     try:
-        m = re.match(r"^\s*NANO_BANANO\s*:\s*(.+)$", str(query or ""), flags=re.I)
+        q = str(query or "")
+        m = re.match(
+            r"^\s*(?:"
+            r"(?:NANO|NANA)\s*[_ ]\s*(?:BANANO|BANANA)"
+            r")\s*(?::|\s)\s*(.+)$",
+            q,
+            flags=re.I,
+        )
         if not m:
             return None
         prompt = str(m.group(1) or "").strip()

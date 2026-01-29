@@ -30,7 +30,7 @@ class AutomationRunner:
 
     def _is_browser_closed_error(self, msg: str) -> bool:
         text = str(msg or "")
-        return "Target page, context or browser has been closed" in text or "has been closed" in text
+        return "Target page, context or browser has been closed" in text or "has been closed" in text or "closed by user" in text
 
     def set_events(self, events: RunnerEvents):
         self.events = events
