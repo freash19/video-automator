@@ -1,5 +1,5 @@
 {
-  "csv_file": "/Users/ilya/Projects/heygen_automation_V2/state/run_projects_1769726482.csv",
+  "csv_file": "/Users/ilya/Projects/heygen_automation_V2/state/run_projects_1769857031.csv",
   "max_scenes": 70,
   "browser": "chrome",
   "enable_enhance_voice": false,
@@ -61,9 +61,10 @@
     "profile_to_use": "Какой профиль использовать (имя или 'ask')"
   },
   "episodes_to_process": [
-    "dangerous_habits_after_60"
+    "ep_prostate_destroyers"
   ],
   "close_media_panel_after_broll": true,
+  "close_browser_on_finish": false,
   "interactive_on_mismatch": false,
   "abort_on_validation_failure": false,
   "profiles": {

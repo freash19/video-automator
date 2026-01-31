@@ -50,6 +50,12 @@ class AutomationRunner:
         self.episodes = eps
 
     async def run_many(self, episodes: List[str]) -> bool:
+        # Ensure browser is open before starting batch
+        if not await self.automation.open_browser():
+             if self.events.on_notice:
+                 self.events.on_notice("error: batch run failed to open browser")
+             return False
+
         sem = asyncio.Semaphore(self.max_concurrency)
         results = []
 
@@ -108,7 +114,10 @@ class AutomationRunner:
                 except Exception:
                     pass
                 try:
-                    if bool(self.config.get("close_browser_on_finish", True)):
+                    # Only close browser if explicitly requested AND not running in batch mode (or it's the last one)
+                    # But here run_ep_part is called for each part. 
+                    # We rely on config "close_browser_on_finish" which we set to False by default now.
+                    if bool(self.config.get("close_browser_on_finish", False)):
                         await self.automation.close_browser()
                 except Exception:
                     pass

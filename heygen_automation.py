@@ -1800,8 +1800,14 @@ class HeyGenAutomation:
             # Переходим на страницу шаблона
             print(f"📄 Открываю шаблон: {template_url}")
             async def _open_template():
-                await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
+                # Reuse existing page if available
+                if page:
+                    await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
+                else:
+                    # Should not happen if _init_session succeeded
+                    raise RuntimeError("No page available for navigation")
                 return True
+
             await self.perform_step("open_template", _open_template, critical=True)
             
             # Ждем загрузки страницы и появления первого поля text_1
