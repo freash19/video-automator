@@ -70,11 +70,46 @@ Created `core/` and `utils/` packages:
 - Add mappings for common Automa blocks.
 - Ensure parameters (selectors, values) are extracted correctly.
 
+## Active Task: Fix — Текст сцен сохраняется после 2 reload (WAT-44)
+**Goal**: На шаблоне HeyGen заполнить 70 сцен из CSV и подтвердить, что после **2 обновлений страницы** тексты остаются заполненными.
+
+**Test Data**:
+- Template: `https://app.heygen.com/create-v4/draft?template_id=a108ce76c12244e8bfc63ba1fe7152d8&private=1`
+- CSV: `WAT - 44.csv` (в корне репозитория)
+
+**Specs (по .traerules)**:
+- `ui-researcher`: через `tools/inspector.py` найти реальный editable текста сцены и способ commit/blur (артефакт `debug/inspection/annotated.png` обязателен).
+- `automation-engineer`:
+  - Вводить текст через найденный editable (не через плейсхолдер-only DOM).
+  - После ввода делать commit (blur/клик вне поля).
+  - Включить `verify_scene_after_insert` (read-back + 1–2 ретрая) и логировать шаги через `perform_step/@step`.
+  - `refresh_and_validate` должен делать двойной reload и финальную проверку 70/70.
+- `qa-tester`: прогнать dry-run на WAT-44 и подтвердить по `automation.log` + артефактам.
+
+**Acceptance Criteria**:
+- AC1: После заполнения и **2 reload** нет `text_N` и нет пустых сцен; 70/70 текстов совпадают с CSV (после нормализации).
+- AC2: В `automation.log` есть шаги `verify_after_insert_*` и `refresh_and_validate_reload_1/2`.
+- AC3: При любой ошибке вставки/валидации создаётся скриншот в `debug/screenshots/` и в логе фиксируется причина.
+- AC4: Селекторы соответствуют приоритету `data-testid` > `aria-label` > `role` > `text`; динамические классы не используются.
+
 ## Pending Tasks
+- [x] Починить удаление лишних сцен в HeyGen: пункт меню `Delete Scene` не находится/не кликается (учесть `Delete Scene` vs `Delete scene`, case-insensitive матч; привязать к правильной сцене, добавить валидацию исчезновения `text_N`).
+- [x] Улучшить отчет об ошибках в списке задач и в отправляемом в телеграм бот сообщении. В телеграме если все прошло без ошибок ставить зеленую галочку ✅ , если есть ошибки - восклицательный знак ⚠️, если не выполнено боле 80% - красный крестик ❌. В обоих вариантах отчета писать список сцен в которых осталась ошибка и какая именно ошибка (не заполнен текст сцены, не вставлен бирол, бирол не установлен на фон, нано банано не сгенерировало изображение) и так для каждой сцены с ошибкой, чтобы пользователь знал, куда смотреть при проверке. 
+Так же вот текущий отчет об ошибках выглядит так 
+HeyGen: ep_clove_water part 2
+Статус: success
+Сцены: 87/70
+Проект: Черновик
+Ссылка: https://app.heygen.com/create-v4/draft?template_id=39d48e33d44041bba2a3415d86488ffb&private=1
+Спикеры: Kenzo
+Как видишь, Сцены: 87/70, чего не может быть. Значит оно считает сцены, которое исправляет либо логика подсчета не верная. Первое число должно показывать, сколько сцен заполнено успешно с биролами, текстом и другими элементами, которые должны быть в сцене. 
+HeyGen: ep_clove_water part 2 - офрмляй таким образом 
+Название эпизода: ep_clove_water (жирным текстом)
+Часть: 2
 - [] по нажатию кнопки Открыть браузер загружать страницу app.heygen.com
 - [] при остановке процесса выполнения, закрывать браузер, убивая процесс. На текущий момент почему даже если закрыть браузер, процесс остается висеть в фоне.
-- [] сделать нажатие на поле с текстом сцены таким же, как нажатие на канву с поиском центральной точки и эмитация реального клика по этой точке.
-- [] Добавить валидацию вставки бирола в сцену. Методология такая: после вставки, нужно нажать повторно на центр канвы и если появится кнопка <button class="prism:tw-rounded-[100px] tw-inline-flex tw-items-center tw-justify-center tw-whitespace-nowrap tw-rounded-md tw-text-[14px] tw-font-primary tw-font-semibold tw-leading-[20px] tw-tracking-normal focus-visible:tw-outline-none focus-visible:tw-ring-1 focus-visible:tw-ring-ring disabled:tw-pointer-events-none disabled:tw-opacity-50 [&amp;_svg]:tw-pointer-events-none [&amp;_svg]:tw-text-current hover:tw-cursor-pointer hover:tw-bg-ux-hover active:tw-bg-ux-active disabled:tw-opacity-disabled prism:tw-text-textTitle prism:hover:tw-bg-ux-hover prism:active:tw-bg-ux-active prism:disabled:tw-text-textDisable prism:disabled:tw-opacity-disabled tw-h-btn-md tw-px-btn-md tw-gap-[6px] tw-text-textTitle tw-p-0" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="radix-:r8r:" data-state="closed"><div class="tw-size-4 tw-rounded-full tw-border tw-border-line" style="background-color: rgb(255, 255, 255);"></div><span class="tw-text-xs tw-font-medium tw-text-textTitle">BG Color</span></button> то повторить вставку бирола. Если после 3 попыток результата нет, перейти к следующей сцене и в отчете указать об ошибке и номере сцены. 
+- [x] сделать нажатие на поле с текстом сцены таким же, как нажатие на канву с поиском центральной точки и эмитация реального клика по этой точке.
+- [x] Добавить валидацию вставки бирола в сцену. Методология такая: после вставки, нужно нажать повторно на центр канвы и если появится кнопка <button class="prism:tw-rounded-[100px] tw-inline-flex tw-items-center tw-justify-center tw-whitespace-nowrap tw-rounded-md tw-text-[14px] tw-font-primary tw-font-semibold tw-leading-[20px] tw-tracking-normal focus-visible:tw-outline-none focus-visible:tw-ring-1 focus-visible:tw-ring-ring disabled:tw-pointer-events-none disabled:tw-opacity-50 [&amp;_svg]:tw-pointer-events-none [&amp;_svg]:tw-text-current hover:tw-cursor-pointer hover:tw-bg-ux-hover active:tw-bg-ux-active disabled:tw-opacity-disabled prism:tw-text-textTitle prism:hover:tw-bg-ux-hover prism:active:tw-bg-ux-active prism:disabled:tw-text-textDisable prism:disabled:tw-opacity-disabled tw-h-btn-md tw-px-btn-md tw-gap-[6px] tw-text-textTitle tw-p-0" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="radix-:r8r:" data-state="closed"><div class="tw-size-4 tw-rounded-full tw-border tw-border-line" style="background-color: rgb(255, 255, 255);"></div><span class="tw-text-xs tw-font-medium tw-text-textTitle">BG Color</span></button> то повторить вставку бирола. Если после 3 попыток результата нет, перейти к следующей сцене и в отчете указать об ошибке и номере сцены. 
 - [] создать базу доступных шаблонов со страницы https://app.heygen.com/templates Чтобы увидеть все шаблоны, нужно нажать на блок "See All". Вот html блока <div class="tw-relative tw-aspect-video tw-w-full tw-overflow-hidden tw-rounded tw-border tw-border-line tw-bg-fill-block tw-text-textTitle tw-flex tw-items-center tw-justify-center tw-gap-1 tw-font-semibold tw-text-sm tw-transition-all tw-duration-200 tw-ease-in-out tw-cursor-pointer hover:tw-text-textTitleRev hover:tw-bg-brand active:tw-text-textTitleRev active:tw-bg-ux-brandActive">See All <iconpark-icon class="iconpark-icon" name="down" theme="filled" size="18" icon-id=""></iconpark-icon></div> Появляется весь список шаблонов и нужно собрать ссылки на все шаблоны внутри #root > div > div > div:nth-child(3) > div > div.tw-flex.tw-min-h-0.tw-w-full.tw-min-w-0.tw-flex-1.tw-flex-col > div.tw-relative.tw-flex.tw-w-full.tw-min-w-0.tw-flex-1.tw-flex-col.tw-overflow-hidden > div.tw-pb-25.tw-relative.tw-h-full.tw-flex-1.tw-overflow-y-auto.tw-overflow-x-hidden.tw-bg-fill-general > div.tw-flex.tw-size-full.tw-flex-col.tw-px-3.sm\:tw-pl-12.sm\:tw-pr-9 > div > div:nth-child(1) или блока class="tw-flex tw-flex-col tw-gap-0 внутри которого есть текст "My Templates". Как собрать список? Находишь первый элемент в гриде и нажимаешь в центр этого блока эмитируя реальный клик. Далее появится всплывающее окно. Там есть примерно такая строка с названием шаблона <h2 id="radix-:r88:" class="tw-text-textTitle tw-text-lg tw-font-bold tw-leading-none tw-tracking-tight dialogTitle">Название шаблона</h2> Сохраняешь его название. Далее нужно полуить ссылку. По нажатию кнопки "Create with" откроется страница шаблона и в адресной строке будет ссылка типа https://app.heygen.com/create-v4/draft?vt=l&template_id=0344d8614d484b16a7ab0531560bae91&private=1&fromCreateButton=true это и будет ссылка для шаблона с названием, которое ты уже сохранил. Возвращаемся на предыдущую страницу и повторяем для следующего шаблона, пока они не закончаться. Для ориентира, на данный момент последний шаблон будет с названием "Крайний шаблон". Это будет последний. Весь список щаблонов добавь в интерфейс и возможность для каждого сценария выбирать один из шаблонов. Это будет вместо ссылки в таблице  template_url. 
 - [x] Наладить работу добавления бирола (выбор видео, установка как фон, удаление переднего слоя).
 - [x] Внедрить систему скачивания и монтажа готовых видео. реализовать сбор всех сгенерированных частей в раздел Результаты. Добавить возможность скачивания и склеики выбранных эпизодов. 

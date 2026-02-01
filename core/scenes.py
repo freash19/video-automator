@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING, Optional, Callable, Awaitable, List, Dict, Any
 from ui.logger import logger
 from utils.helpers import normalize_speaker_key, normalize_text_for_compare
 from core.browser import safe_click, read_locator_text, fast_replace_text
-from core.browser import human_fast_center_click
+from core.browser import human_fast_center_click, human_coordinate_click, _show_click_marker
+from ui.step_wrapper import step
 
 if TYPE_CHECKING:
     from playwright.async_api import Page, Locator
@@ -23,6 +24,140 @@ if TYPE_CHECKING:
 SCENE_TEXT_SELECTOR = 'span[data-node-view-content-react]'
 MORE_BUTTON_SELECTOR = 'button:has(iconpark-icon[name="more-level"])'
 DELETE_MENU_SELECTOR = 'div[role="menuitem"]'
+
+
+@step("find_scene_anchor")
+async def find_scene_anchor(
+    page: "Page",
+    scene_number: int,
+) -> Optional["Locator"]:
+    """
+    Find the locator for a scene's number anchor.
+    Uses regex to match the exact number.
+    """
+    try:
+        # Regex for exact number match
+        pattern = re.compile(rf"^{scene_number}$")
+        # Look for the number text
+        locator = page.get_by_text(pattern, exact=True)
+        
+        count = await locator.count()
+        if count > 0:
+            # Return the first visible one
+            for i in range(count):
+                loc = locator.nth(i)
+                if await loc.is_visible():
+                    return loc
+            return locator.first
+    except Exception as e:
+        logger.error(f"[find_scene_anchor] error: {e}")
+    
+    return None
+
+
+@step("click_scene_input")
+async def click_scene_input(
+    page: "Page",
+    anchor: "Locator",
+) -> bool:
+    """
+    Click the input area for a scene, relative to its anchor.
+    Clicks with an offset of +100px from the anchor.
+    """
+    try:
+        box = await anchor.bounding_box()
+        if not box:
+            return False
+            
+        # Target: +100px to the right of the anchor
+        target_x = box["x"] + box["width"] + 100
+        target_y = box["y"] + box["height"] * 0.5
+        
+        # Visual feedback
+        await _show_click_marker(page, target_x, target_y)
+        
+        # Human-like movement and click
+        await page.mouse.move(target_x, target_y)
+        await asyncio.sleep(random.uniform(0.05, 0.1))
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.1))
+        await page.mouse.up()
+        
+        return True
+    except Exception as e:
+        logger.error(f"[click_scene_input] error: {e}")
+        return False
+
+
+@step("smart_delete_scene")
+async def smart_delete_scene(
+    page: "Page",
+    scene_number: int,
+) -> bool:
+    """
+    Delete a scene, automatically handling empty (Trash) or filled (Menu) states.
+    """
+    try:
+        # 1. Find Anchor
+        anchor = await find_scene_anchor(page, scene_number)
+        if not anchor:
+            logger.warning(f"[smart_delete_scene] Scene {scene_number} anchor not found")
+            return False
+            
+        # 2. Focus the scene to reveal controls
+        if not await click_scene_input(page, anchor):
+            logger.warning(f"[smart_delete_scene] Could not click scene {scene_number} input")
+            return False
+            
+        await asyncio.sleep(0.5) # Wait for UI to update
+        
+        # 3. Check for Trash Icon (Empty Scene)
+        # We look for a visible trash icon. 
+        # Assuming the focused scene shows the trash icon if it's empty.
+        trash_btn = page.locator('button:has(iconpark-icon[name="delete"])')
+        
+        # Iterate to find the one that is likely associated with our scene?
+        # Since we just clicked the scene, it should be active.
+        # But there might be other trash icons (e.g. from other scenes if hovered?).
+        # We'll take the first visible one for now.
+        count = await trash_btn.count()
+        for i in range(count):
+            btn = trash_btn.nth(i)
+            if await btn.is_visible():
+                logger.info(f"[smart_delete_scene] Deleting empty scene {scene_number} via Trash icon")
+                return await human_coordinate_click(page, btn)
+             
+        # 4. If no trash, look for "More" button (Filled Scene)
+        more_btn = page.locator(MORE_BUTTON_SELECTOR)
+        count = await more_btn.count()
+        target_more = None
+        for i in range(count):
+            btn = more_btn.nth(i)
+            if await btn.is_visible():
+                target_more = btn
+                break
+        
+        if target_more:
+             logger.info(f"[smart_delete_scene] Deleting filled scene {scene_number} via Menu")
+             if not await human_coordinate_click(page, target_more):
+                 return False
+                 
+             await asyncio.sleep(0.5)
+             
+             # Click Delete in Menu
+             delete_item = page.locator(DELETE_MENU_SELECTOR).filter(
+                 has_text=re.compile(r"Delete|Удалить")
+             )
+             
+             if await delete_item.count() > 0:
+                 return await human_coordinate_click(page, delete_item.first)
+                 
+        logger.warning(f"[smart_delete_scene] Could not find delete controls for scene {scene_number}")
+        return False
+        
+    except Exception as e:
+        logger.error(f"[smart_delete_scene] error: {e}")
+        return False
 
 
 async def find_scene_locator(
@@ -118,6 +253,13 @@ async def insert_text_in_scene(
         await gate_callback()
     
     try:
+        editor = page.locator('div[contenteditable="true"][role="textbox"][translate="no"][tabindex="0"]')
+        try:
+            await editor.first.wait_for(state="visible", timeout=5000)
+            await editor.first.focus(timeout=3000)
+        except Exception:
+            pass
+
         await page.keyboard.press('Meta+A')
         await asyncio.sleep(0.05)
         await page.keyboard.press('Backspace')
@@ -128,7 +270,16 @@ async def insert_text_in_scene(
         
         await page.keyboard.insert_text(text)
         await asyncio.sleep(random.uniform(0.1, 0.2))
-        # Tab removed as per requirements
+        try:
+            await editor.first.evaluate("(el) => el && el.blur && el.blur()")
+        except Exception:
+            pass
+        try:
+            canvas = page.locator("#editorCanvasWrapper")
+            if await canvas.count() > 0:
+                await human_coordinate_click(page, canvas.first)
+        except Exception:
+            pass
         
         # Optional: Enhance Voice button
         if enable_enhance_voice:
@@ -396,7 +547,7 @@ async def delete_empty_scenes(
             
             # Find and click delete menu item
             delete_item = page.locator(DELETE_MENU_SELECTOR).filter(
-                has_text=re.compile(r'Удалить сцену|Delete scene')
+                has_text=re.compile(r'(Удалить\s*сцену|Delete\s*Scene)', re.I)
             )
             
             try:
@@ -411,7 +562,19 @@ async def delete_empty_scenes(
             await safe_click(delete_item.first, page, timeout_ms=3000)
             await asyncio.sleep(random.uniform(0.5, 0.8))
             
-            logger.info(f"[delete_empty_scenes] deleted scene {scene_num}")
+            try:
+                await page.wait_for_selector(
+                    f'{SCENE_TEXT_SELECTOR}:has-text("{text_label}")',
+                    state="detached",
+                    timeout=validation_timeout_ms,
+                )
+                logger.info(f"[delete_empty_scenes] deleted scene {scene_num}")
+            except Exception:
+                still_there = await page.locator(f'{SCENE_TEXT_SELECTOR}:has-text("{text_label}")').count()
+                if still_there > 0:
+                    logger.warning(f"[delete_empty_scenes] scene {scene_num} delete not confirmed")
+                else:
+                    logger.info(f"[delete_empty_scenes] deleted scene {scene_num}")
             
         except asyncio.CancelledError:
             raise

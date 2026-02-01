@@ -50,6 +50,40 @@
 - `tools/inspector.py`: "Глаза" системы — парсинг селекторов, аннотированные скриншоты.
 - `tools/healthcheck.py`: Проверка доступности браузера/сервиса.
 
+### Testing Resources (URLs)
+- **Primary Template**: `https://app.heygen.com/create-v4/draft?template_id=0344d8614d484b16a7ab0531560bae91&private=1`
+- **Secondary Template**: `https://app.heygen.com/create-v4/draft?template_id=9472b0f7df9841f5b1edf8e6a26de1a1&private=1` (Использовать только при явном указании: "Используй вторичный шаблон").
+
+### External Tools: Deep Event Tracker
+Для решения сложных задач навигации и исправления ошибок (после Double-Fail STOP) используется ручной ввод данных из браузерной консоли.
+
+1. Формат передачи данных (JSON Array)
+Пользователь предоставляет массив событий, захваченных скриптом Deep Event Tracker, в следующем формате:
+
+JSON
+[
+  {
+    "type": "click",
+    "timestamp": 1706700000000,
+    "coordinates": { "x": 450, "y": 800 },
+    "target": {
+      "tagName": "BUTTON",
+      "innerText": "Save",
+      "path": "body > div#root > ... > button.save-btn",
+      "attributes": {
+        "data-testid": "save-button-v4",
+        "aria-label": "Сохранить изменения"
+      }
+    }
+  }
+]
+2. Протокол обработки данных агентами
+Extraction: При получении такого массива агент обязан извлечь coordinates для немедленного выполнения шага через human_coordinate_click.
+
+Learning: Агент должен проанализировать path и attributes (особенно data-testid и aria-label), чтобы обновить файл core/locators.py и предотвратить повторные ошибки.
+
+Priority: Данные из этого JSON имеют высший приоритет над результатами автоматического поиска ui-researcher.
+
 ### Configuration
 
 - `.env`: API-ключи (GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, и др.).
@@ -97,6 +131,9 @@ class Settings(BaseSettings):
 ---
 
 ## Conventions & Agentic Standards
+Визуализация клика: Любой клик по координатам обязан сопровождаться отрисовкой временного красного маркера через page.evaluate.
+
+Изоляция вкладок: При поиске элементов в правой панели HeyGen всегда использовать уточняющий селектор .tw-grid-cols-2
 
 ### Selector Strategy (Strict)
 

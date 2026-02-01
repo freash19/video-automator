@@ -22,6 +22,7 @@ from core.broll import (
     handle_nano_banano
 )
 from core.browser import prepare_canvas_for_broll, human_coordinate_click, human_fast_center_click
+from core.scenes import delete_empty_scenes as delete_empty_scenes_core
 from utils.clipboard import parse_nano_banano_prompt
 
 class HeyGenAutomation:
@@ -1020,6 +1021,15 @@ class HeyGenAutomation:
                     pass
                 # -------------------------
 
+                editor = page.locator(
+                    'div[contenteditable="true"][role="textbox"][translate="no"][tabindex="0"]'
+                )
+                try:
+                    await editor.first.wait_for(state="visible", timeout=5000)
+                    await editor.first.focus(timeout=3000)
+                except Exception:
+                    pass
+
                 await page.keyboard.press('Meta+A')
                 await asyncio.sleep(0.05)
                 await page.keyboard.press('Backspace')
@@ -1028,8 +1038,17 @@ class HeyGenAutomation:
                 await self._await_gate()
                 await page.keyboard.insert_text(text)
                 await asyncio.sleep(random.uniform(0.1, 0.2))
-                await page.keyboard.press('Tab')
-                await asyncio.sleep(random.uniform(0.1, 0.2))
+                try:
+                    await editor.first.evaluate("(el) => el && el.blur && el.blur()")
+                except Exception:
+                    pass
+                try:
+                    canvas = page.locator("#editorCanvasWrapper")
+                    if await canvas.count() > 0:
+                        await human_coordinate_click(page, canvas.first)
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(0.15, 0.3))
                 try:
                     if bool(self.config.get('enable_enhance_voice', False)):
                         btn = page.locator('button#voice-enhancement-jeFjSzUn:has-text("Enhance Voice")')
@@ -1065,7 +1084,74 @@ class HeyGenAutomation:
                 self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
                 return False
             if self.verify_scene_after_insert:
-                pass
+                async def _verify_scene():
+                    editor = page.locator(
+                        'div[contenteditable="true"][role="textbox"][translate="no"][tabindex="0"]'
+                    )
+                    expected_norm = self.normalize_text_for_compare(text)
+                    if not expected_norm:
+                        return True
+
+                    for attempt in range(3):
+                        await self._await_gate()
+                        await asyncio.sleep(0.25)
+                        try:
+                            cur = await editor.first.inner_text(timeout=2000)
+                        except Exception:
+                            cur = ""
+                        cur_norm = self.normalize_text_for_compare(cur)
+                        if expected_norm in cur_norm:
+                            return True
+
+                        try:
+                            await span_locator.first.scroll_into_view_if_needed()
+                        except Exception:
+                            pass
+                        try:
+                            await page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                        try:
+                            await human_fast_center_click(page, span_locator.first)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.15)
+
+                        try:
+                            await editor.first.focus(timeout=3000)
+                        except Exception:
+                            pass
+                        try:
+                            await page.keyboard.press("Meta+A")
+                            await asyncio.sleep(0.05)
+                            await page.keyboard.press("Backspace")
+                            await asyncio.sleep(0.05)
+                            if attempt >= 1:
+                                await page.keyboard.type(str(text or ""), delay=15)
+                            else:
+                                await page.keyboard.insert_text(str(text or ""))
+                            await asyncio.sleep(0.15)
+                            try:
+                                await editor.first.evaluate("(el) => el && el.blur && el.blur()")
+                            except Exception:
+                                pass
+                            try:
+                                canvas = page.locator("#editorCanvasWrapper")
+                                if await canvas.count() > 0:
+                                    await human_coordinate_click(page, canvas.first)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                    return False
+
+                step_name_verify = f"verify_after_insert_{scene_number}" if not safe_speaker else f"verify_after_insert_{scene_number}_{safe_speaker}"
+                ok_verify = await self.perform_step(step_name_verify, _verify_scene, critical=True)
+                if not ok_verify:
+                    self._emit_notice(f"❌ scene_verify_failed: scene={scene_number}")
+                    self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": False})
+                    return False
             self._emit_notice(f"✅ scene_done: scene={scene_number}")
             self._emit_step({"type": "finish_scene", "scene": scene_number, "ok": True})
             return True
@@ -1087,118 +1173,14 @@ class HeyGenAutomation:
     # Поиск по бейджу сцены отключен по запросу
     
     async def delete_empty_scenes(self, page: Page, filled_scenes_count: int, max_scenes: int = 15):
-        """
-        Удалить все пустые сцены после заполненных
-        
-        Args:
-            page: Playwright страница
-            filled_scenes_count: Количество заполненных сцен
-            max_scenes: Максимальное количество сцен в шаблоне
-        """
-        empty_scenes = list(range(filled_scenes_count + 1, max_scenes + 1))
-        
-        if not empty_scenes:
-            print("✅ Все сцены заполнены, удаление не требуется")
-            return
-        
-        print(f"\n🗑️  Удаляю пустые сцены: {empty_scenes}")
-        await self._await_gate()
-        try:
-            await page.wait_for_selector('span[data-node-view-content-react]', timeout=self.validation_ready_timeout_ms)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await asyncio.sleep(self.post_reload_wait)
-        
-        for scene_num in empty_scenes:
-            await self._await_gate()
-            try:
-                text_label = f"text_{scene_num}"
-                print(f"  🗑️  Удаляю сцену {scene_num}: {text_label}")
-                
-                # Находим span с текстом text_X
-                span_locator = page.locator(f'span[data-node-view-content-react]:has-text("{text_label}")')
-                
-                # Проверяем существование
-                count = await span_locator.count()
-                if count == 0:
-                    print(f"  ⚠️  Сцена {text_label} не найдена, пропускаю")
-                    continue
-                
-                # Кликаем на span, чтобы выделить сцену (устойчиво)
-                await span_locator.first.scroll_into_view_if_needed()
-                try:
-                    await page.keyboard.press('Escape')
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-                try:
-                    await span_locator.first.click(timeout=3000)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    try:
-                        await span_locator.first.click(timeout=3000, force=True)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        box = await span_locator.first.bounding_box()
-                        if box:
-                            await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                await asyncio.sleep(random.uniform(0.3, 0.5))
-                
-                # Ищем кнопку с тремя точками (more-level)
-                more_button = page.locator('button:has(iconpark-icon[name="more-level"])')
-                
-                # Проверяем существование кнопки
-                button_count = await more_button.count()
-                if button_count == 0:
-                    print(f"  ⚠️  Кнопка меню не найдена для {text_label}")
-                    continue
-                
-                # Кликаем на кнопку с тремя точками (берем последнюю видимую)
-                try:
-                    await more_button.last.click()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await more_button.first.click(force=True)
-                await asyncio.sleep(random.uniform(0.3, 0.5))
-                
-                # Ждем появления меню и ищем пункт
-                delete_item = page.locator('div[role="menuitem"]').filter(has_text=re.compile(r'Удалить сцену|Delete scene'))
-                try:
-                    await delete_item.first.wait_for(state='visible', timeout=2000)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-                
-                # Проверяем существование пункта меню
-                delete_count = await delete_item.count()
-                if delete_count == 0:
-                    print(f"  ⚠️  Пункт 'Удалить сцену' не найден")
-                    continue
-                
-                # Кликаем на "Удалить сцену"
-                try:
-                    await delete_item.first.click()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await delete_item.first.click(force=True)
-                await asyncio.sleep(random.uniform(0.5, 0.8))
-                
-                print(f"  ✅ Сцена {scene_num} удалена")
-                
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"  ❌ Ошибка при удалении сцены {scene_num}: {e}")
-                continue
-        
-        print("✅ Удаление пустых сцен завершено")
+        await delete_empty_scenes_core(
+            page,
+            filled_scenes_count,
+            max_scenes=max_scenes,
+            gate_callback=self._await_gate,
+            validation_timeout_ms=self.validation_ready_timeout_ms,
+            post_reload_wait=self.post_reload_wait,
+        )
     
     async def click_generate_button(self, page: Page):
         """
@@ -1800,14 +1782,8 @@ class HeyGenAutomation:
             # Переходим на страницу шаблона
             print(f"📄 Открываю шаблон: {template_url}")
             async def _open_template():
-                # Reuse existing page if available
-                if page:
-                    await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
-                else:
-                    # Should not happen if _init_session succeeded
-                    raise RuntimeError("No page available for navigation")
+                await page.goto(template_url, wait_until='domcontentloaded', timeout=120000)
                 return True
-
             await self.perform_step("open_template", _open_template, critical=True)
             
             # Ждем загрузки страницы и появления первого поля text_1
@@ -3019,50 +2995,77 @@ class HeyGenAutomation:
                 pass
 
     async def refresh_and_validate(self, page: Page, scenes: list, interactive: bool = True):
-        # Обновление страницы
-        print("\n🔄 Обновляю страницу для проверки вставленных текстов...")
-        try:
-            await self._await_gate()
-            await self.click_save_and_wait(page)
-            await self._await_gate()
-            await page.reload(wait_until='domcontentloaded', timeout=self.reload_timeout_ms)
-            try:
-                await page.wait_for_load_state('networkidle', timeout=self.validation_ready_timeout_ms)
-            except Exception:
-                pass
-            try:
-                await page.wait_for_selector('span[data-node-view-content-react]', timeout=self.validation_ready_timeout_ms)
-            except Exception:
-                await self._await_gate()
-                await asyncio.sleep(self.post_reload_wait)
-        except Exception as e:
-            print(f"⚠️ Ошибка при обновлении страницы: {e}")
-            await self._await_gate()
-            await asyncio.sleep(self.post_reload_wait)
-
-        # Повторная замена оставшихся плейсхолдеров text_X
+        print("\n🔄 Обновляю страницу для проверки вставленных текстов (2 reload)...")
         scenes_by_idx = {int(s['scene_idx']): s['text'] for s in scenes}
         changed = False
-        try:
-            locator = page.locator('span[data-node-view-content-react]')
-            texts = await locator.all_inner_texts()
-            remaining = []
-            for t in texts:
-                m = re.fullmatch(r"\s*text_(\d+)\s*", t or "")
-                if m:
-                    remaining.append(int(m.group(1)))
-            if remaining:
-                print(f"⚠️ Найдены не заполненные плейсхолдеры: {remaining}")
-            for idx in remaining:
+
+        async def _reload_once(round_idx: int):
+            try:
                 await self._await_gate()
-                expected = scenes_by_idx.get(idx)
-                if expected:
-                    await self.fill_scene(page, idx, expected)
+                await self.click_save_and_wait(page)
+                await self._await_gate()
+                await page.reload(wait_until="domcontentloaded", timeout=self.reload_timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=self.validation_ready_timeout_ms)
+                except Exception:
+                    pass
+                try:
+                    await page.wait_for_selector(
+                        "span[data-node-view-content-react]", timeout=self.validation_ready_timeout_ms
+                    )
+                except Exception:
                     await self._await_gate()
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(self.post_reload_wait)
+                return True
+            except Exception as e:
+                print(f"⚠️ Ошибка при обновлении страницы (round={round_idx}): {e}")
+                await self._await_gate()
+                await asyncio.sleep(self.post_reload_wait)
+                return False
+
+        async def _fix_placeholders(round_idx: int):
+            try:
+                locator = page.locator("span[data-node-view-content-react]")
+                texts = await locator.all_inner_texts()
+                remaining = []
+                for t in texts:
+                    m = re.fullmatch(r"\s*text_(\d+)\s*", t or "")
+                    if m:
+                        remaining.append(int(m.group(1)))
+                if remaining:
+                    print(f"⚠️ Найдены не заполненные плейсхолдеры (round={round_idx}): {remaining}")
+                any_fixed = False
+                for idx in remaining:
+                    await self._await_gate()
+                    expected = scenes_by_idx.get(idx)
+                    if expected:
+                        await self.fill_scene(page, idx, expected)
+                        await self._await_gate()
+                        await asyncio.sleep(0.2)
+                        any_fixed = True
+                return {"fixed": any_fixed, "remaining": remaining}
+            except Exception as e:
+                print(f"⚠️ Не удалось выполнить проверку плейсхолдеров (round={round_idx}): {e}")
+                return {"fixed": False, "remaining": []}
+
+        for round_idx in (1, 2):
+            ok_reload = await self.perform_step(
+                f"refresh_and_validate_reload_{round_idx}",
+                lambda round_idx=round_idx: _reload_once(round_idx),
+                critical=True,
+            )
+            if not ok_reload:
+                return {"ok": False, "changed": changed, "missing": []}
+            fixed_res = await self.perform_step(
+                f"refresh_and_validate_fix_placeholders_{round_idx}",
+                lambda round_idx=round_idx: _fix_placeholders(round_idx),
+                critical=False,
+            )
+            try:
+                if isinstance(fixed_res, dict) and fixed_res.get("fixed"):
                     changed = True
-        except Exception as e:
-            print(f"⚠️ Не удалось выполнить проверку плейсхолдеров: {e}")
+            except Exception:
+                changed = True
 
         # Проверка наличия ожидаемых текстов
         print("\n🔍 Проверяю наличие ожидаемых текстов из CSV...")
