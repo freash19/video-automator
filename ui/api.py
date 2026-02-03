@@ -45,6 +45,63 @@ _automation_refs: Dict[str, HeyGenAutomation] = {}
 _task_status: Dict[str, Dict[str, Any]] = {}
 _task_scene_done: Dict[str, set] = {}
 _global_scene_done: set = set()
+_browser_watchdog: Optional[asyncio.Task] = None
+
+def _ensure_browser_watchdog() -> None:
+    global _browser_watchdog
+    if _browser_watchdog is not None and not _browser_watchdog.done():
+        return
+    async def _watch() -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                auto = getattr(runner, "automation", None)
+                if auto is None:
+                    continue
+                alive = True
+                try:
+                    page = getattr(auto, "_page", None)
+                    if page is not None and page.is_closed():
+                        alive = False
+                except Exception:
+                    pass
+                try:
+                    ctx = getattr(auto, "playwright_context", None)
+                    if ctx is not None:
+                        pages = getattr(ctx, "pages", None)
+                        if pages is not None and len(pages) == 0:
+                            alive = False
+                except Exception:
+                    pass
+                try:
+                    br = getattr(auto, "browser", None)
+                    if br is not None and hasattr(br, "is_connected") and not br.is_connected():
+                        alive = False
+                except Exception:
+                    pass
+                if alive:
+                    continue
+                running = False
+                try:
+                    running = any(t is not None and not t.done() for t in _active_tasks.values())
+                except Exception:
+                    running = False
+                if running:
+                    await _stop_all_tasks("browser_closed")
+                else:
+                    try:
+                        await auto.close_browser()
+                    except Exception:
+                        pass
+                    try:
+                        _log.append({"level": "info", "msg": "browser_closed"})
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+    _browser_watchdog = asyncio.create_task(_watch())
 
 def _now_ts() -> int:
     try:
@@ -698,12 +755,48 @@ async def _run_one(ep: str, part: int) -> bool:
         except Exception:
             pass
             
+        try:
+            _ensure_browser_watchdog()
+        except Exception:
+            pass
         if not await runner.automation.open_browser():
             _set_task_status(tinfo, "failed")
             tinfo["error"] = "Could not open browser"
             return False
 
+        created_page = None
+        reuse_single_tab = False
+        try:
+            reuse_single_tab = int(getattr(runner, "max_concurrency", 1) or 1) <= 1
+        except Exception:
+            reuse_single_tab = False
+
+        shared_ctx = None
+        try:
+            shared_ctx = getattr(runner.automation, "playwright_context", None)
+        except Exception:
+            shared_ctx = None
+        if shared_ctx is None:
+            try:
+                br = getattr(runner.automation, "browser", None)
+                if br is not None and hasattr(br, "contexts") and br.contexts:
+                    shared_ctx = br.contexts[0]
+            except Exception:
+                shared_ctx = None
+
         auto = HeyGenAutomation(runner.csv_path, runner.config, browser=runner.automation.browser, playwright=runner.automation.playwright)
+        try:
+            auto.playwright_context = shared_ctx
+        except Exception:
+            pass
+        try:
+            if reuse_single_tab:
+                auto._page = getattr(runner.automation, "_page", None)
+            elif shared_ctx is not None:
+                created_page = await shared_ctx.new_page()
+                auto._page = created_page
+        except Exception:
+            pass
         try:
             auto.df = runner.automation.df
         except Exception:
@@ -793,6 +886,11 @@ async def _run_one(ep: str, part: int) -> bool:
         try:
             from ui.state import update_project_status
             update_project_status(ep, "completed" if ok else "failed")
+        except Exception:
+            pass
+        try:
+            if created_page is not None and not created_page.is_closed():
+                await created_page.close()
         except Exception:
             pass
         return bool(ok)
@@ -1267,6 +1365,10 @@ async def api_open_browser(payload: Dict[str, Any] = None):
         profiles = cfg.get('profiles', {})
         profile = profiles.get(profile_to_use, {}) if profile_to_use else {}
         
+        try:
+            _ensure_browser_watchdog()
+        except Exception:
+            pass
         ok = await runner.automation.open_browser()
         if not ok:
             profile_info = ""
@@ -1278,6 +1380,27 @@ async def api_open_browser(payload: Dict[str, Any] = None):
                 else:
                     profile_info = f" Профиль: {profile_to_use} (Chromium)."
             raise RuntimeError(f"Не удалось открыть браузер.{profile_info}")
+        try:
+            auto = runner.automation
+            page = getattr(auto, "_page", None)
+            if page is None or (hasattr(page, "is_closed") and page.is_closed()):
+                ctx = getattr(auto, "playwright_context", None)
+                if ctx is not None:
+                    page = await ctx.new_page()
+                    try:
+                        auto._page = page
+                    except Exception:
+                        pass
+            if page is not None:
+                async def _goto():
+                    await page.goto("https://app.heygen.com/projects", wait_until="domcontentloaded", timeout=60000)
+                    return True
+                try:
+                    await auto.perform_step("goto_heygen_home", _goto, critical=False)
+                except Exception:
+                    await _goto()
+        except Exception:
+            pass
         try:
             _log.append({"level": "info", "msg": "browser_opened"})
         except Exception:

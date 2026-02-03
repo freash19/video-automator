@@ -81,6 +81,8 @@ class HeyGenAutomation:
         self._current_part_idx = None
         self._last_error = ""
         self._page = None
+        self.playwright_context = None
+        self._owns_browser_process = False
         self.task_status: TaskStatus | None = None
         try:
             os.makedirs("debug/screenshots", exist_ok=True)
@@ -1354,20 +1356,33 @@ class HeyGenAutomation:
         Returns:
             True если браузер успешно открыт
         """
+        try:
+            page = getattr(self, "_page", None)
+            if page is not None and not page.is_closed():
+                return True
+        except Exception:
+            pass
+        try:
+            ctx = getattr(self, "playwright_context", None)
+            if ctx is not None:
+                pages = getattr(ctx, "pages", None)
+                if pages:
+                    try:
+                        self._page = pages[0]
+                    except Exception:
+                        pass
+                    return True
+        except Exception:
+            pass
         if self.browser is not None:
             try:
-                # Check if browser is still connected
-                if self.playwright_context and self.playwright_context.pages:
-                    # Ping functionality or just assume true if pages exist
-                    return True
-                if self.browser.is_connected():
+                if hasattr(self.browser, "is_connected") and self.browser.is_connected():
                     return True
             except Exception:
-                # If connection check failed, reset and try to launch again
                 print("⚠️ Browser connection lost, restarting...")
                 self.browser = None
                 self.playwright_context = None
-                self.page = None
+                self._page = None
 
         try:
             p = await async_playwright().start()
@@ -1396,6 +1411,7 @@ class HeyGenAutomation:
                     print("❌ Не задан 'multilogin_cdp_url' в config.json")
                     raise RuntimeError("multilogin_cdp_url missing")
                 browser = await p.chromium.connect_over_cdp(multilogin_cdp_url)
+                self._owns_browser_process = False
                 print("✅ Подключился к Multilogin по CDP!")
             elif not force_embedded:
                 chosen_cdp = chrome_cdp_url
@@ -1452,6 +1468,7 @@ class HeyGenAutomation:
                         print(f"✅ Connected to existing browser at {chosen_cdp}")
                         self.browser = browser
                         self.playwright_context = browser.contexts[0]
+                        self._owns_browser_process = False
                         # Don't return yet, let it flow to page creation if needed
                     else:
                         print("⚠️ Connected but no contexts found.")
@@ -1499,6 +1516,7 @@ class HeyGenAutomation:
 
                     try:
                         browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                        self._owns_browser_process = True
                         print(f"✅ Браузер запущен с профилем: {profile_to_use} на порту {cdp_port}")
                         
                         # Stealth init script
@@ -1519,6 +1537,7 @@ class HeyGenAutomation:
                         launch_kwargs.pop("executable_path", None)
                         launch_kwargs.pop("channel", None)
                         browser = await p.chromium.launch_persistent_context(**launch_kwargs)
+                        self._owns_browser_process = True
                         print(f"✅ Fallback: Chromium запущен с профилем: {profile_to_use}")
             else:
                 auth_state_path = "debug/auth_state.json"
@@ -1534,33 +1553,68 @@ class HeyGenAutomation:
                     headless=False,
                     args=launch_args
                 )
+                self._owns_browser_process = True
                 print("✅ Запущен встроенный Chromium (force_embedded_browser)!")
 
-            contexts = browser.contexts
-            if not contexts:
-                auth_state_path = "debug/auth_state.json"
-                context_options = {
-                    "viewport": {"width": 1280, "height": 800},
-                    "ignore_https_errors": True
-                }
-
-                if os.path.exists(auth_state_path):
-                    print(f"📂 Загружаю состояние авторизации из {auth_state_path}")
-                    context_options["storage_state"] = auth_state_path
+            context = None
+            try:
+                if hasattr(browser, "pages") and not hasattr(browser, "contexts"):
+                    context = browser
+                    try:
+                        self.playwright_context = context
+                    except Exception:
+                        pass
+                    try:
+                        self.browser = context.browser
+                    except Exception:
+                        self.browser = None
                 else:
-                    print("⚠️ Файл авторизации не найден, запускаю чистую сессию")
+                    contexts = browser.contexts
+                    if contexts:
+                        context = contexts[0]
+                        try:
+                            self.browser = browser
+                        except Exception:
+                            pass
+                        try:
+                            self.playwright_context = context
+                        except Exception:
+                            pass
+                    else:
+                        auth_state_path = "debug/auth_state.json"
+                        context_options = {
+                            "viewport": {"width": 1280, "height": 800},
+                            "ignore_https_errors": True
+                        }
+                        if os.path.exists(auth_state_path):
+                            print(f"📂 Загружаю состояние авторизации из {auth_state_path}")
+                            context_options["storage_state"] = auth_state_path
+                        else:
+                            print("⚠️ Файл авторизации не найден, запускаю чистую сессию")
+                        context = await browser.new_context(**context_options)
+                        try:
+                            await context.add_init_script("""
+                                Object.defineProperty(navigator, 'webdriver', {
+                                    get: () => undefined
+                                });
+                            """)
+                        except Exception:
+                            pass
+                        try:
+                            self.browser = browser
+                        except Exception:
+                            pass
+                        try:
+                            self.playwright_context = context
+                        except Exception:
+                            pass
+            except Exception:
+                context = None
 
-                context = await browser.new_context(**context_options)
+            if context is None:
+                raise RuntimeError("browser_context_missing")
 
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-                """)
-            else:
-                context = contexts[0]
-
-            if not context.pages:
+            if not getattr(context, "pages", None):
                 page = await context.new_page()
             else:
                 page = context.pages[0]
@@ -1570,7 +1624,6 @@ class HeyGenAutomation:
             except Exception:
                 pass
             
-            self.browser = browser
             self._page = page
             return True
         except Exception as e:
@@ -1625,37 +1678,68 @@ class HeyGenAutomation:
         try:
             async def _init_session():
                 nonlocal p, page
-                # Используем существующий браузер, если он есть
-                if self.browser is not None and self.playwright is not None:
+                if self.playwright is not None:
                     p = self.playwright
-                    browser = self.browser
-                    contexts = browser.contexts
-                    if not contexts:
-                        auth_state_path = "debug/auth_state.json"
-                        context_options = {
-                            "viewport": {"width": 1280, "height": 800},
-                            "ignore_https_errors": True
-                        }
-                        if os.path.exists(auth_state_path):
-                            context_options["storage_state"] = auth_state_path
-                        context = await browser.new_context(**context_options)
-                        await context.add_init_script("""
-                            Object.defineProperty(navigator, 'webdriver', {
-                                get: () => undefined
-                            });
-                        """)
-                    else:
-                        context = contexts[0]
-                    if not context.pages:
-                        page = await context.new_page()
-                    else:
-                        page = context.pages[0]
                     try:
-                        page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
+                        existing = getattr(self, "_page", None)
+                        if existing is not None and not existing.is_closed():
+                            page = existing
+                            return True
                     except Exception:
                         pass
-                    self._page = page
-                    return True
+                    ctx = getattr(self, "playwright_context", None)
+                    if ctx is None and self.browser is not None and hasattr(self.browser, "pages") and not hasattr(self.browser, "contexts"):
+                        ctx = self.browser
+                    if ctx is not None:
+                        if not getattr(ctx, "pages", None):
+                            page = await ctx.new_page()
+                        else:
+                            page = ctx.pages[0]
+                        try:
+                            page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
+                        except Exception:
+                            pass
+                        self.playwright_context = ctx
+                        self._page = page
+                        return True
+                    if self.browser is not None:
+                        browser = self.browser
+                        contexts = []
+                        try:
+                            contexts = browser.contexts
+                        except Exception:
+                            contexts = []
+                        if not contexts:
+                            auth_state_path = "debug/auth_state.json"
+                            context_options = {
+                                "viewport": {"width": 1280, "height": 800},
+                                "ignore_https_errors": True
+                            }
+                            if os.path.exists(auth_state_path):
+                                context_options["storage_state"] = auth_state_path
+                            ctx2 = await browser.new_context(**context_options)
+                            try:
+                                await ctx2.add_init_script("""
+                                    Object.defineProperty(navigator, 'webdriver', {
+                                        get: () => undefined
+                                    });
+                                """)
+                            except Exception:
+                                pass
+                            ctx = ctx2
+                        else:
+                            ctx = contexts[0]
+                        if not getattr(ctx, "pages", None):
+                            page = await ctx.new_page()
+                        else:
+                            page = ctx.pages[0]
+                        try:
+                            page.set_default_timeout(float(self.config.get('playwright_timeout_ms', 5000)))
+                        except Exception:
+                            pass
+                        self.playwright_context = ctx
+                        self._page = page
+                        return True
                 
                 p = await async_playwright().start()
                 print("\n🌐 Подключаюсь к браузеру через CDP...")
@@ -2978,19 +3062,60 @@ class HeyGenAutomation:
         except Exception:
             pass
 
+    @step("close_browser")
     async def close_browser(self):
+        p = getattr(self, "playwright", None)
+        page = getattr(self, "_page", None)
+        ctx = getattr(self, "playwright_context", None)
+        br = getattr(self, "browser", None)
         try:
-            page = getattr(self, "_page", None)
-            if page is not None:
+            if ctx is None and page is not None:
                 try:
-                    browser = page.context.browser
-                    if browser is not None:
-                        await browser.close()
+                    ctx = page.context
+                except Exception:
+                    ctx = None
+            if ctx is not None:
+                try:
+                    await ctx.close()
                 except Exception:
                     pass
+            if br is not None:
+                try:
+                    await br.close()
+                except Exception:
+                    try:
+                        d = getattr(br, "disconnect", None)
+                        if callable(d):
+                            try:
+                                await d()
+                            except TypeError:
+                                d()
+                    except Exception:
+                        pass
         finally:
             try:
+                if p is not None:
+                    await p.stop()
+            except Exception:
+                pass
+            try:
                 self._page = None
+            except Exception:
+                pass
+            try:
+                self.playwright_context = None
+            except Exception:
+                pass
+            try:
+                self.browser = None
+            except Exception:
+                pass
+            try:
+                self.playwright = None
+            except Exception:
+                pass
+            try:
+                self._owns_browser_process = False
             except Exception:
                 pass
 
